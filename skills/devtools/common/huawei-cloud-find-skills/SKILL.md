@@ -81,7 +81,7 @@ SKILLS_CN_EN_MAP_URL=https://gitcode.com/api/v5/repos/2501_91318609/skills-for-i
 ```
 
 
-## Core Workflow and Core Commands
+## Core Workflow
 
 ### Step 1: Search Skills
 
