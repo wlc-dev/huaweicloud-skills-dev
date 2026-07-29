@@ -1,6 +1,6 @@
 ---
 name: huawei-cloud-storage-query
-description: "Queries Huawei Cloud storage resources (EVS/OBS/SFS/CBR). Covers cloud disks (volumes/snapshots/types/quotas/recycle bin), OBS buckets (ACL/metadata/notifications/policies/objects), SFS Turbo file systems (shares/perm rules/backend targets/quotas/LDAP/AD), and CBR backups (vaults/policies/backups/tasks/agents/protectables). No write operations. Use this skill when the user needs to query disk info, list buckets/objects, check file system status, or view backup/policy details. Triggers: 云硬盘, EVS, 对象存储, OBS, 文件系统, SFS, 备份, CBR, 存储库, 快照, 桶, volume, bucket, backup, vault."
+description: "Queries Huawei Cloud storage resources (EVS/OBS/SFS/CBR). Covers cloud disks (volumes/snapshots/types/quotas/recycle bin), OBS buckets (ACL/metadata/notifications/policies/objects), SFS Turbo file systems (shares/perm rules/backend targets/quotas/LDAP/AD), and CBR backups (vaults/policies/backups/tasks/agents/protectables). No write operations. Use this skill when the user needs to query disk info, list buckets/objects, check file system status, or view backup/policy details. Triggers: 云硬盘, EVS, 对象存储, OBS, 文件系统, SFS, 备22份, CBR, 存储库, 快照, 桶, volume, bucket, backup, vault."
 ---
 # Huawei Cloud Resource Query
 
