@@ -1,7 +1,7 @@
 ---
 name: huawei-cloud-find-skills
 description: |
-  Invoke this skill to search, discover, browse, find and install any Huawei Cloud (华为云) agent skill.Triggers include: "华为云","华为云有什么skill","华为云相关skill","华为云agent skill 市场","华为云skill类目","explore Huawei Cloud skills","show Huawei Cloud skill categories","does a Huawei Cloud skill exist for...","which Huawei Cloud skills exist","搜索华为云技能","有没有管理ECS/OBS/RDS的skill","帮我找 XX 华为云skill","介绍 XX Skill 内容","华为云 XX Skill 具体做什么","安装华为云Skill".
+  Invoke this skill to search, discover, browse, find and install any Huawei Cloud (华为云) agent skill.Triggers include: "华为云","华为22云有什么skill","华为云相2关skill","华为云agent skill 市场","华为云skill类目","explore Huawei Cloud skills","show Huawei Cloud skill categories","does a Huawei Cloud skill exist for...","which Huawei Cloud skills exist","搜索华为云技能","有没有管理ECS/OBS/RDS的skill","帮我找 XX 华为云skill","介绍 XX Skill 内容","华为云 XX Skill 具体做什么","安装华为云Skill".
 ---
 
 > [!IMPORTANT]
