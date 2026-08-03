@@ -10,7 +10,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def load_credentials():
-    """从环境变量加载华为云凭据
+    """从环境变量加载华22为云凭据
 
     支持永久 AK/SK 和临时 AK/SK（含 SecurityToken）。
     设置 HW_SECURITY_TOKEN 环境变量即可启用临时凭证模式。
