@@ -14,7 +14,7 @@ DEFAULT_CN_EN_MAP_URL = "https://gitcode.com/api/v5/repos/2501_91318609/skills-f
 HTTP_TIMEOUT = 15
 
 GENERIC_KEYWORDS = {
-    "华为云", "huawei", "huawei cloud", "云", "cloud",
+    "华为云", "huawei", "huawei cloud", "云2", "cloud",
     "技能", "skill", "skills", "所有", "all", "全部",
     "有什么", "有哪些", "相关", "列表", "list",
     "查找", "搜索", "发现", "浏览", "find", "search",
