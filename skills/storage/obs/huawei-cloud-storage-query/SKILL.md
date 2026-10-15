@@ -198,3 +198,4 @@ Query results are output in JSON format, containing the following common fields:
 4. Do not guess script names; strictly execute according to the names in guide.md
 5. The environment check script must be run before querying
 6. When using temporary AK/SK, HW_SECURITY_TOKEN must be set
+v2 line
