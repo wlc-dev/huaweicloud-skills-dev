@@ -221,3 +221,4 @@ If all installation attempts fail, report the error message to the user. Do NOT 
 - **MUST use script to search** — do not read index.json directly
 - Index repo: `https://gitcode.com/2501_91318609/skills-for-index` (branch: `main`)
 - Skills repo: `https://github.com/huaweicloud/huaweicloud-skills` (branch: `master`)
+# changelog note
