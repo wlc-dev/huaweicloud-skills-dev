@@ -1,0 +1,48 @@
+{
+  "skill_name": "huawei-cloud-obs-dir-count",
+  "region": "cn-north-4",
+  "test_cases": [
+    {
+      "id": "TC-01",
+      "name": "Immediate directory count (CLI auto)",
+      "command": "python3 scripts/count_obs_directories.py --bucket obs-hd-dev-static",
+      "expected": "Single integer = number of immediate subdirectories",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-02",
+      "name": "Immediate directory count (SDK)",
+      "command": "python3 scripts/count_obs_directories.py --bucket obs-hd-dev-static --executor sdk",
+      "expected": "Single integer matching CLI count",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-03",
+      "name": "Recursive directory count",
+      "command": "python3 scripts/count_obs_directories.py --bucket obs-hd-dev-static --recursive",
+      "expected": "Single integer >= immediate count",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-04",
+      "name": "Directory count under prefix",
+      "command": "python3 scripts/count_obs_directories.py --bucket obs-hd-dev-static --prefix .arts",
+      "expected": "Single integer = subdirectories under .arts",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-05",
+      "name": "SDK availability check",
+      "command": "python3 -c \"from huaweicloudsdkobs.v1.obs_client import ObsClient; print('SDK OK')\"",
+      "expected": "SDK import succeeds",
+      "type": "syntax",
+      "executor": "sdk"
+    }
+  ],
+  "env_vars_required": ["HUAWEI_ACCESS_KEY", "HUAWEI_SECRET_KEY"],
+  "notes": "只读操作，无资源创建/修改/删除风险。测试 bucket 可通过 TEST_OBS_BUCKET 覆盖。"
+}
