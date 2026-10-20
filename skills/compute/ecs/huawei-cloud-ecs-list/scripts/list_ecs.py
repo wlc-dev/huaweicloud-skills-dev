@@ -122,6 +122,23 @@ PREFERRED_COLUMNS = [
     "host_id",
 ]
 
+# Fixed column subset (key, Chinese header) used by the Markdown inventory
+# table. Reuses the leading `PREFERRED_COLUMNS` keys so the report shows the
+# most useful ECS attributes instead of only name/ID. Multi-value fields such
+# as the private/public IPs are already comma-joined by `normalize_server`;
+# missing values render as `-` through `_md_cell`.
+MD_TABLE_COLUMNS = [
+    ("name", "实例名称"),
+    ("id", "实例 ID"),
+    ("status", "状态"),
+    ("flavor", "规格"),
+    ("vcpus", "vCPU"),
+    ("ram", "内存"),
+    ("availability_zone", "可用区"),
+    ("privateIps", "私网IP"),
+    ("publicIps", "公网IP"),
+]
+
 _SERVER_LIST_KEYS = ("servers", "server_list", "servers_detail", "serverInfos")
 
 _CREDENTIAL_MISSING_PATTERNS = (
@@ -639,9 +656,14 @@ def _md_cell(value):
 def render_markdown(region, servers, generated_at=None, filters=None):
     """Render the ECS inventory as a Markdown report.
 
-    Contains the queried region, the query timestamp, the instance total and an
-    `实例名称 | 实例 ID` table. An empty result renders `共 0 个实例` instead of
-    an empty table; the filters actually applied are always listed when present.
+    Contains the queried region, the query timestamp, the instance total and a
+    multi-column inventory table (see `MD_TABLE_COLUMNS`: name / ID / status /
+    flavor / vCPU / memory / availability zone / private IPs / public IPs).
+    Values are read through `normalize_server`, so nested `flavor` / `addresses`
+    / AZ fields are flattened and multi-value IP lists are comma-joined; missing
+    values render as `-`. Cells are escaped by `_md_cell`. An empty result
+    renders `共 0 个实例` instead of an empty table; the filters actually applied
+    are always listed when present.
     """
     filters = list(filters or [])
     servers = list(servers or [])
@@ -659,14 +681,18 @@ def render_markdown(region, servers, generated_at=None, filters=None):
         suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
         lines.append("共 0 个实例%s" % suffix)
     else:
-        lines.append("| 实例名称 | 实例 ID |")
-        lines.append("| --- | --- |")
+        lines.append("| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS))
+        lines.append("| %s |" % " | ".join("---" for _ in MD_TABLE_COLUMNS))
         for server in servers:
-            name = _field(server, "name", "instance_name", default=None)
+            flat = normalize_server(server)
+            name = _field(flat, "name", "instance_name", default=None)
             if name is None:
-                name = _field(server, "id", "server_id")
-            sid = _field(server, "id", "server_id")
-            lines.append("| %s | %s |" % (_md_cell(name), _md_cell(sid)))
+                name = _field(flat, "id", "server_id")
+            cells = []
+            for key, _ in MD_TABLE_COLUMNS:
+                value = name if key == "name" else _field(flat, key)
+                cells.append(_md_cell(value))
+            lines.append("| %s |" % " | ".join(cells))
     lines.append("")
     return "\n".join(lines)
 

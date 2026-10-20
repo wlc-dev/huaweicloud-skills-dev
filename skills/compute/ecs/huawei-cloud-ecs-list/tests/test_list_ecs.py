@@ -17,6 +17,7 @@ from list_ecs import (  # noqa: E402
     ConfigError,
     GuardError,
     EcsListError,
+    MD_TABLE_COLUMNS,
     OutputError,
     active_filter_descriptions,
     build_command,
@@ -710,6 +711,51 @@ class TestMarkdownReport(unittest.TestCase):
                              datetime.datetime(2026, 10, 20))
         self.assertIn("| web 01 | ecs\\|1 |", md)
 
+    def test_render_multi_column_header(self):
+        # Issue #20: the inventory table must be multi-column (>2) and carry the
+        # fixed name/ID/status/flavor/vCPU/memory/AZ/private-IP/public-IP set.
+        md = render_markdown("cn-north-4", [SERVER_1, SERVER_2],
+                             datetime.datetime(2026, 10, 20))
+        header = "| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS)
+        self.assertIn(header, md)
+        self.assertIn("| --- | --- | --- | --- | --- | --- | --- | --- | --- |", md)
+        labels = [label for _, label in MD_TABLE_COLUMNS]
+        for expected in ("实例名称", "实例 ID", "状态", "规格", "vCPU", "内存",
+                         "可用区", "私网IP", "公网IP"):
+            self.assertIn(expected, labels)
+        self.assertGreater(len(MD_TABLE_COLUMNS), 2)
+
+    def test_render_multi_column_rows(self):
+        md = render_markdown("cn-north-4", [SERVER_1, SERVER_2],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn(
+            "| ecs-web-01 | ecs-0001 | ACTIVE | s6.large.2 | 2 | 4096 | "
+            "cn-north-4a | 192.168.0.10 | - |", md)
+        # SERVER_2 has a floating IP -> comma-joined public IP value.
+        self.assertIn(
+            "| ecs-db-02 | ecs-0002 | SHUTOFF | s6.xlarge.2 | 4 | 8192 | "
+            "cn-north-4b | 192.168.0.11 | 10.0.0.5 |", md)
+
+    def test_render_multi_value_ips_comma_joined(self):
+        server = {
+            "id": "ecs-multi",
+            "name": "ecs-multi",
+            "addresses": {
+                "vpc-subnet": [
+                    {"addr": "192.168.0.20", "OS-EXT-IPS:type": "fixed"},
+                    {"addr": "192.168.0.21", "OS-EXT-IPS:type": "fixed"},
+                ]
+            },
+        }
+        md = render_markdown("cn-north-4", [server], datetime.datetime(2026, 10, 20))
+        self.assertIn("192.168.0.20,192.168.0.21", md)
+
+    def test_render_missing_columns_render_dash(self):
+        md = render_markdown("cn-north-4", [{"id": "ecs-9"}],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn(
+            "| ecs-9 | ecs-9 | - | - | - | - | - | - | - |", md)
+
     def test_default_name_uses_region_and_date(self):
         self.assertEqual(
             default_markdown_name("cn-north-4",
@@ -814,9 +860,11 @@ class TestMainMarkdownOutput(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertTrue(os.path.isfile(target))
         content = self._read(target)
+        full_header = "| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS)
         for fragment in ("**Region**: cn-north-4", "**查询时间**:",
-                         "**实例总数**: 2", "| 实例名称 | 实例 ID |",
-                         "| ecs-web-01 | ecs-0001 |", "| ecs-db-02 | ecs-0002 |"):
+                         "**实例总数**: 2", full_header,
+                         "| ecs-web-01 | ecs-0001 | ACTIVE | s6.large.2 | 2 | "
+                         "4096 | cn-north-4a | 192.168.0.10 | - |"):
             self.assertIn(fragment, content)
         self.assertIn(os.path.abspath(target), out)
         # The default stdout table is still printed (additive, not exclusive).
