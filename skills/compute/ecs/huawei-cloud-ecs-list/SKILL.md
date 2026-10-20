@@ -9,7 +9,8 @@ description: |
      名称/ID/状态/规格(vCPU/内存)/可用区/私网IP/公网IP), --json (raw response
      array), --names-only (compact instance-name + ID inventory), plus an
      additive Markdown export (--md-file / --output-md) that writes Region +
-     查询时间 + 实例总数 + `实例名称 | 实例 ID` table to a .md file.
+     查询时间 + 实例总数 + a multi-column inventory table
+     (名称/ID/状态/规格/vCPU/内存/可用区/私网IP/公网IP) to a .md file.
   3. Supports --status / --name server-side filtering (both are real
      ListServersDetails query parameters), region override, and automatic offset
      paging.
@@ -68,10 +69,12 @@ Key properties:
   name/vcpus/ram, `addresses` split into private/public IPs, and the
   `OS-EXT-AZ:availability_zone` attribute surfaced as `availability_zone`.
 - **Additive Markdown export** — `--md-file [PATH]` writes an archival report
-  (Region / 查询时间 / 实例总数 + `实例名称 | 实例 ID` table, empty list →
-  `共 0 个实例`, active filters listed) *in addition to* the stdout output,
-  which stays exactly as before. The file is written through a temporary
-  sibling and moved into place, so a failed write never leaves a half file.
+  (Region / 查询时间 / 实例总数 + a multi-column inventory table
+  `名称 | ID | 状态 | 规格 | vCPU | 内存 | 可用区 | 私网IP | 公网IP`, empty
+  list → `共 0 个实例`, active filters listed) *in addition to* the stdout
+  output, which stays exactly as before. The file is written through a
+  temporary sibling and moved into place, so a failed write never leaves a half
+  file.
 - **Offline-testable** — every code path (paging, filters, error
   classification, guard, SDK fallback, Markdown rendering and file write) is
   covered by unit tests that mock the hcloud subprocess.
@@ -176,14 +179,19 @@ of whatever stdout mode is active and never changes the stdout output.
 
 ## 实例清单
 
-| 实例名称 | 实例 ID |
-| --- | --- |
-| ecs-web-01 | ecs-0001 |
-| ecs-db-02 | ecs-0002 |
+| 实例名称 | 实例 ID | 状态 | 规格 | vCPU | 内存 | 可用区 | 私网IP | 公网IP |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ecs-web-01 | ecs-0001 | ACTIVE | s6.large.2 | 2 | 4096 | cn-north-4a | 192.168.0.10 | - |
+| ecs-db-02 | ecs-0002 | SHUTOFF | s6.xlarge.2 | 4 | 8192 | cn-north-4b | 192.168.0.11 | 10.0.0.5 |
 ```
 
 - The report is UTF-8. `查询时间` is the local time of the query; the file name
   uses `<YYYYMMDD>` of the same moment.
+- The inventory table has a fixed column order — 实例名称 / 实例 ID / 状态 /
+  规格 / vCPU / 内存 / 可用区 / 私网IP / 公网IP. `flavor` is flattened into
+  规格/vCPU/内存 and `addresses` into 私网IP/公网IP, exactly like the stdout
+  table. A multi-value field (e.g. several private IPs) is comma-joined; a
+  missing value renders as `-`.
 - Empty result → `共 0 个实例`（+ the filters actually sent, e.g.
   `共 0 个实例（过滤条件: status=ACTIVE）`), exit code 0 — same as the stdout
   behaviour for an empty region.
@@ -286,8 +294,10 @@ matches the real `ListServersDetailsRequest` signature), SDK field remapping
 `OS-EXT-AZ:availability_zone`), rendering (table with flavor/IP/AZ fields /
 names / summary lines / fallbacks), all main() output modes including empty,
 filter, and error paths, and the Markdown report: `render_markdown`
-(Region / 查询时间 / 实例总数 / table / empty-list message / filters / pipe and
-newline escaping / ID fallback), `default_markdown_name`, `format_query_time`,
+(Region / 查询时间 / 实例总数 / multi-column table with the fixed
+名称·ID·状态·规格·vCPU·内存·可用区·私网IP·公网IP header / comma-joined
+multi-value IPs / `-` for missing values / empty-list message / filters / pipe
+and newline escaping / ID fallback), `default_markdown_name`, `format_query_time`,
 `write_markdown_file` (UTF-8 round-trip, overwrite, missing directory and
 unwritable target → `OutputError` with no half file and no temp sibling), and
 `main()` with `--md-file` / `--output-md` (explicit path, default file name,
