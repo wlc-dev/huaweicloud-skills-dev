@@ -1,7 +1,10 @@
+import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -14,20 +17,27 @@ from list_bms import (  # noqa: E402
     BmsListError,
     ConfigError,
     GuardError,
+    MD_TABLE_COLUMNS,
+    OutputError,
+    active_filter_descriptions,
     build_command,
     classify_hcloud_failure,
+    default_markdown_name,
     extract_json,
     extract_servers,
     filter_by_server_id,
+    format_query_time,
     guard_operation,
     guard_write_intent,
     list_servers,
     list_servers_via_sdk,
     main,
     normalize_server,
+    render_markdown,
     render_table,
     server_names,
     strip_status_tokens,
+    write_markdown_file,
 )
 
 SERVER_1 = {
@@ -123,6 +133,31 @@ class TestWriteIntentGuard(unittest.TestCase):
         with self.assertRaises(GuardError):
             guard_write_intent(
                 " ".join(strip_status_tokens(["--status", "REBOOT", "reboot", "x"])))
+
+    def test_strip_status_tokens_exempts_md_file_values(self):
+        # The Markdown output path is file-system data, not a cloud operation:
+        # a report named `bms-delete-report.md` must not trip the guard.
+        self.assertEqual(
+            strip_status_tokens(["--md-file", "bms-delete-report.md"]), [])
+        self.assertEqual(
+            strip_status_tokens(["--md-file=bms-start-report.md"]), [])
+        self.assertEqual(
+            strip_status_tokens(["--output-md", "bms-reboot-report.md"]), [])
+        # `--md-file` takes an optional value: a following *flag* is still
+        # scanned, so a mutating flag cannot hide behind it.
+        self.assertIn("--operation",
+                      strip_status_tokens(["--md-file", "--operation",
+                                           "DeleteBareMetalServer"]))
+        # A status enumerant is still exempt alongside the md path.
+        self.assertFalse(guard_write_intent(" ".join(
+            strip_status_tokens(["--status", "REBOOT",
+                                 "--md-file", "bms-rebuild-report.md"]))))
+
+    def test_md_file_path_with_write_words_not_blocked(self):
+        self.assertFalse(guard_write_intent(
+            " ".join(strip_status_tokens(["--md-file", "bms-delete-report.md"]))))
+        self.assertFalse(guard_write_intent(
+            " ".join(strip_status_tokens(["--md-file=bms-resize-report.md"]))))
 
 
 class TestBuildCommand(unittest.TestCase):
@@ -619,9 +654,291 @@ class TestMain(unittest.TestCase):
         self.assertIn("写操作意图", err)
 
 
+class TestMarkdownReport(unittest.TestCase):
+    """render_markdown / naming helpers (offline, no file system)."""
+
+    def test_render_contains_region_time_total_and_table(self):
+        md = render_markdown("cn-north-4", [SERVER_1, SERVER_2],
+                             datetime.datetime(2026, 10, 20, 9, 30, 0))
+        self.assertIn("# Huawei Cloud BMS 裸金属服务器清单", md)
+        self.assertIn("**Region**: cn-north-4", md)
+        self.assertIn("**查询时间**: 2026-10-20 09:30:00", md)
+        self.assertIn("**主机总数**: 2", md)
+        self.assertIn("| 名称 | ID |", md)
+        self.assertIn("| --- | --- |", md)
+        self.assertIn("| bms-demo-01 | bms-0001 |", md)
+        self.assertIn("| bms-demo-02 | bms-0002 |", md)
+
+    def test_render_generated_at_defaults_to_now(self):
+        md = render_markdown("cn-north-4", [SERVER_1])
+        self.assertRegex(md, r"\*\*查询时间\*\*: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+    def test_render_name_falls_back_to_id(self):
+        md = render_markdown("cn-north-4", [{"id": "bms-9"}],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn("| bms-9 | bms-9 |", md)
+
+    def test_render_empty_list_message_and_filters(self):
+        md = render_markdown("cn-south-1", [], datetime.datetime(2026, 10, 20),
+                             filters=["status=ACTIVE", "name=bms-01",
+                                      "server_id=bms-0001"])
+        self.assertIn("**主机总数**: 0", md)
+        self.assertIn("共 0 个裸金属服务器", md)
+        self.assertIn("status=ACTIVE, name=bms-01, server_id=bms-0001", md)
+        self.assertNotIn("| 名称", md)
+
+    def test_render_empty_list_without_filters(self):
+        md = render_markdown("cn-south-1", [], datetime.datetime(2026, 10, 20))
+        self.assertIn("共 0 个裸金属服务器", md)
+        self.assertNotIn("过滤条件", md)
+
+    def test_render_escapes_pipes_and_newlines(self):
+        md = render_markdown("cn-north-4", [{"id": "bms|1", "name": "web\n01"}],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn("| web 01 | bms\\|1 |", md)
+
+    def test_render_fixed_column_header(self):
+        # The inventory table must carry the fixed name/ID/status/flavor/AZ/IP set.
+        md = render_markdown("cn-north-4", [SERVER_1, SERVER_2],
+                             datetime.datetime(2026, 10, 20))
+        header = "| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS)
+        self.assertIn(header, md)
+        self.assertIn("| --- | --- | --- | --- | --- | --- |", md)
+        labels = [label for _, label in MD_TABLE_COLUMNS]
+        for expected in ("名称", "ID", "状态", "规格", "可用区", "IP"):
+            self.assertIn(expected, labels)
+
+    def test_render_fixed_column_rows(self):
+        md = render_markdown("cn-north-4", [SERVER_1, SERVER_2],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn(
+            "| bms-demo-01 | bms-0001 | ACTIVE | s4.xlarge | cn-north-4a | "
+            "10.0.0.5 |", md)
+        self.assertIn(
+            "| bms-demo-02 | bms-0002 | SHUTOFF | s3.large | cn-north-4b | "
+            "10.0.0.6 |", md)
+
+    def test_render_missing_columns_render_dash(self):
+        md = render_markdown("cn-north-4", [{"id": "bms-9"}],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn("| bms-9 | bms-9 | - | - | - | - |", md)
+
+    def test_render_normalizes_flavor_and_az_keys(self):
+        # flavor_name / availability_zone are produced by normalize_server.
+        md = render_markdown("cn-north-4", [SERVER_1],
+                             datetime.datetime(2026, 10, 20))
+        self.assertIn("s4.xlarge", md)
+        self.assertIn("cn-north-4a", md)
+
+    def test_default_name_uses_region_and_date(self):
+        self.assertEqual(
+            default_markdown_name("cn-north-4",
+                                  datetime.datetime(2026, 10, 20, 23, 59)),
+            "bms-list-cn-north-4-20261020.md")
+        self.assertEqual(
+            default_markdown_name("cn-south-1", datetime.datetime(2026, 1, 2)),
+            "bms-list-cn-south-1-20260102.md")
+
+    def test_format_query_time(self):
+        self.assertEqual(
+            format_query_time(datetime.datetime(2026, 1, 2, 3, 4, 5)),
+            "2026-01-02 03:04:05")
+        self.assertRegex(format_query_time(), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+    def test_active_filter_descriptions(self):
+        self.assertEqual(
+            active_filter_descriptions("ACTIVE", "bms-01", "bms-0001"),
+            ["status=ACTIVE", "name=bms-01", "server_id=bms-0001"])
+        self.assertEqual(active_filter_descriptions(status="ACTIVE"),
+                         ["status=ACTIVE"])
+        self.assertEqual(active_filter_descriptions(), [])
+
+
+class TestMarkdownFileWrite(unittest.TestCase):
+    """write_markdown_file: UTF-8, atomic, no half file on failure."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="bms-md-write-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_writes_utf8_and_returns_absolute_path(self):
+        target = os.path.join(self.dir, "out.md")
+        path = write_markdown_file(target, "# 裸金属服务器清单\ntext\n")
+        self.assertEqual(path, os.path.abspath(target))
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "# 裸金属服务器清单\ntext\n")
+        # No temporary sibling left behind.
+        self.assertEqual(os.listdir(self.dir), ["out.md"])
+
+    def test_overwrites_existing_report(self):
+        target = os.path.join(self.dir, "out.md")
+        write_markdown_file(target, "old")
+        write_markdown_file(target, "new")
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "new")
+
+    def test_missing_directory_raises_and_leaves_nothing(self):
+        target = os.path.join(self.dir, "nope", "out.md")
+        with self.assertRaises(OutputError) as ctx:
+            write_markdown_file(target, "x")
+        self.assertIn("无法写入 Markdown 文件", str(ctx.exception))
+        self.assertFalse(os.path.exists(target))
+        self.assertFalse(os.path.exists(os.path.dirname(target)))
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_unwritable_target_raises_and_leaves_no_temp(self):
+        # A directory as the target makes the final move fail everywhere
+        # (root included, unlike a chmod-based permission test).
+        target = os.path.join(self.dir, "target-dir")
+        os.mkdir(target)
+        with self.assertRaises(OutputError) as ctx:
+            write_markdown_file(target, "x")
+        self.assertIn("无法写入 Markdown 文件", str(ctx.exception))
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(os.listdir(self.dir), ["target-dir"])
+
+
+class TestMainMarkdownOutput(unittest.TestCase):
+    """`main()` end-to-end for --md-file / --output-md (mocked hcloud)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="bms-md-main-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._cwd = os.getcwd()
+        self.addCleanup(os.chdir, self._cwd)
+        os.chdir(self.dir)
+
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_bms.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    @staticmethod
+    def _page(servers):
+        return [(json.dumps({"servers": servers, "count": len(servers)}), "", 0)]
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_explicit_path_creates_report_and_hints_absolute_path(self):
+        target = os.path.join(self.dir, "inventory.md")
+        rc, out, err = self._run(
+            ["--md-file", target], self._page([SERVER_1, SERVER_2]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(os.path.isfile(target))
+        content = self._read(target)
+        full_header = "| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS)
+        for fragment in ("**Region**: cn-north-4", "**查询时间**:",
+                         "**主机总数**: 2", full_header,
+                         "| bms-demo-01 | bms-0001 | ACTIVE | s4.xlarge | "
+                         "cn-north-4a | 10.0.0.5 |"):
+            self.assertIn(fragment, content)
+        self.assertIn(os.path.abspath(target), out)
+        # The default stdout table is still printed (additive, not exclusive).
+        self.assertIn("裸金属服务器列表", out)
+
+    def test_no_value_uses_default_file_name(self):
+        rc, out, err = self._run(["--md-file"], self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        expected = "bms-list-cn-north-4-%s.md" % datetime.date.today().strftime("%Y%m%d")
+        self.assertEqual(os.listdir(self.dir), [expected])
+        self.assertIn(os.path.abspath(expected), out)
+        self.assertIn("| bms-demo-01 | bms-0001 |", self._read(expected))
+
+    def test_no_value_uses_requested_region_in_default_name(self):
+        rc, out, err = self._run(["-r", "cn-south-1", "--md-file"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        expected = "bms-list-cn-south-1-%s.md" % datetime.date.today().strftime("%Y%m%d")
+        self.assertEqual(os.listdir(self.dir), [expected])
+        self.assertIn("**Region**: cn-south-1", self._read(expected))
+
+    def test_output_md_alias(self):
+        rc, out, err = self._run(["--output-md", "alias.md"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "alias.md")))
+
+    def test_path_with_write_words_not_blocked(self):
+        rc, out, err = self._run(["--md-file=bms-delete-report.md"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("写操作意图", err)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.dir, "bms-delete-report.md")))
+
+    def test_empty_list_report_exits_zero(self):
+        rc, out, err = self._run(["--status", "ACTIVE", "--md-file", "empty.md"],
+                                 self._page([]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        content = self._read(os.path.join(self.dir, "empty.md"))
+        self.assertIn("共 0 个裸金属服务器", content)
+        self.assertIn("status=ACTIVE", content)
+        self.assertIn("**主机总数**: 0", content)
+        # stdout behaviour for an empty list is unchanged.
+        self.assertIn("无裸金属服务器", out)
+
+    def test_empty_list_with_filter_in_message(self):
+        rc, out, err = self._run(
+            ["--status", "ACTIVE", "--server-id", "bms-0001"],
+            self._page([]))
+        self.assertEqual(rc, 0)
+        self.assertIn("status=ACTIVE", out)
+        self.assertIn("server_id=bms-0001", out)
+
+    def test_write_failure_reports_error_and_exits_one(self):
+        target = os.path.join(self.dir, "absent-dir", "out.md")
+        rc, out, err = self._run(["--md-file", target], self._page([SERVER_1]))
+        self.assertEqual(rc, 1)
+        self.assertIn("[错误]", err)
+        self.assertIn("无法写入 Markdown 文件", err)
+        self.assertFalse(os.path.exists(target))
+        self.assertFalse(os.path.exists(os.path.dirname(target)))
+        # No half file / temp sibling anywhere.
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_json_mode_unchanged_and_no_file_without_flag(self):
+        rc, out, err = self._run(["--json"], self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [SERVER_1])
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_names_only_md_is_additive(self):
+        rc, out, err = self._run(["--names-only", "--md-file", "inv.md"],
+                                 self._page([SERVER_1, SERVER_2]))
+        self.assertEqual(rc, 0)
+        self.assertIn("bms-demo-01", out)
+        self.assertNotIn("physical.s4.xlarge", out)
+        self.assertIn("| bms-demo-02 | bms-0002 |",
+                      self._read(os.path.join(self.dir, "inv.md")))
+
+    def test_md_written_before_write_intent_still_blocked(self):
+        rc, out, err = self._run(["--md-file", "out.md", "--operation",
+                                  "DeleteBareMetalServer"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("写操作意图", err)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_mutating_flag_after_md_file_still_blocked(self):
+        rc, out, err = self._run(["--md-file", "--names-only",
+                                  "--operation", "DeleteBareMetalServer"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("写操作意图", err)
+        self.assertEqual(os.listdir(self.dir), [])
+
+
 class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
-        for exc in (GuardError, ConfigError, AuthError, ApiError):
+        for exc in (GuardError, ConfigError, AuthError, ApiError, OutputError):
             self.assertTrue(issubclass(exc, BmsListError))
 
 

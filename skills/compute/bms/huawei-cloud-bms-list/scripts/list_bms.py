@@ -5,18 +5,20 @@ Primary execution path is KooCLI (read-only GET
 `/v1/{project_id}/baremetalservers/detail`); when hcloud is not installed the
 script falls back to the official `huaweicloudsdkbms` v1 SDK
 (`list_bare_metal_servers`). Reads nothing but the active credential profile /
-environment. Supports three output modes (table / --json / --names-only),
---name / --status server-side filters (both are real ListBareMetalServers
-query parameters) plus a --server-id client-side filter (the API has no
-server-id parameter), page-number offset paging, and a strict write-intent
-guard: any argument that looks like a mutating BMS operation (create / delete /
-update / reboot / rebuild / resize / reinstall / reset / attach / detach /
-change ...) is rejected before a single command is executed.
+environment. Supports three stdout modes (table / --json / --names-only) plus
+an additive Markdown file export (--md-file / --output-md), --name / --status
+server-side filters (both are real ListBareMetalServers query parameters) plus
+a --server-id client-side filter (the API has no server-id parameter),
+page-number offset paging, and a strict write-intent guard: any argument that
+looks like a mutating BMS operation (create / delete / update / reboot / rebuild
+/ resize / reinstall / reset / attach / detach / change ...) is rejected before
+a single command is executed.
 
 Usage:
     python3 scripts/list_bms.py [--region cn-north-4] [--json | --names-only]
-                                 [--name bms-01] [--server-id <uuid>]
-                                 [--status ACTIVE] [--page-size 100]
+                                 [--md-file [PATH]] [--name bms-01]
+                                 [--server-id <uuid>] [--status ACTIVE]
+                                 [--page-size 100]
                                  [--operation ListBareMetalServers]
 
 Environment overrides (mostly for tests):
@@ -30,6 +32,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
@@ -107,6 +111,19 @@ PREFERRED_COLUMNS = [
     "tags",
 ]
 
+# Fixed column subset (key, Chinese header) used by the Markdown inventory
+# table. Reuses `normalize_server`'s flattened keys: 名称/ID/状态/规格/可用区/IP.
+# Missing values render as `-` through `_md_cell`; a missing name falls back to
+# the server ID.
+MD_TABLE_COLUMNS = [
+    ("name", "名称"),
+    ("id", "ID"),
+    ("status", "状态"),
+    ("flavor_name", "规格"),
+    ("availability_zone", "可用区"),
+    ("access_i_pv4", "IP"),
+]
+
 _SERVER_LIST_KEYS = (
     "servers",
     "baremetal_servers",
@@ -179,6 +196,10 @@ class ApiError(BmsListError):
     """hcloud / network / unexpected API failure."""
 
 
+class OutputError(BmsListError):
+    """The Markdown report could not be written (bad directory / permission)."""
+
+
 def guard_write_intent(text):
     """Raise GuardError if `text` carries a mutating intent.
 
@@ -207,23 +228,33 @@ def guard_operation(operation):
 
 
 def strip_status_tokens(argv):
-    """Drop `--status <value>` / `--status=<value>` pairs before the guard scan.
+    """Drop read-only values before the guard scan.
 
-    REBOOT / HARD_REBOOT / REBUILD are legitimate BMS *status* enumerants but
-    contain write-looking words; the status filter value must therefore be
-    exempted from the write-intent scan while every other argument stays
-    guarded.
+    Two kinds of argument values are legitimate read / file-system *data* rather
+    than cloud operations and must be exempted from the write-intent scan:
+
+    - `--status <value>` — BMS status enumerants (`REBOOT` / `HARD_REBOOT` /
+      `REBUILD`) contain write-looking words but are read-only filters.
+    - `--md-file <path>` / `--output-md <path>` — the Markdown output path is a
+      local file name, so a report such as `bms-delete-report.md` or
+      `bms-start-report.md` must not trip the guard.
+
+    The value of `--md-file` / `--output-md` is *optional*, so a token following
+    such a flag is stripped only when it is not itself a flag: `--md-file
+    --create-server` therefore still exposes the mutating flag to the guard.
     """
+    flags = ("--status", "-status", "--md-file", "--output-md")
     kept = []
     skip = False
     for token in argv:
         if skip:
             skip = False
-            continue
-        if token in ("--status", "-status"):
+            if not token.startswith("-"):
+                continue
+        if token in flags:
             skip = True
             continue
-        if token.startswith("--status=") or token.startswith("-status="):
+        if any(token.startswith(flag + "=") for flag in flags):
             continue
         kept.append(token)
     return kept
@@ -537,6 +568,121 @@ def server_names(servers):
     return names
 
 
+def active_filter_descriptions(status=None, name=None, server_id=None):
+    """Human-readable description of the filters actually applied.
+
+    `--status` / `--name` are server-side ListBareMetalServers parameters;
+    `--server-id` is applied client-side by `filter_by_server_id()`.
+    """
+    filters = []
+    if status:
+        filters.append("status=%s" % status)
+    if name:
+        filters.append("name=%s" % name)
+    if server_id:
+        filters.append("server_id=%s" % server_id)
+    return filters
+
+
+def _as_datetime(value):
+    """Return `value` as a datetime, defaulting to the current local time."""
+    if isinstance(value, datetime):
+        return value
+    return datetime.now().astimezone()
+
+
+def format_query_time(value=None):
+    """Format the query timestamp for the Markdown header (local time + zone)."""
+    moment = _as_datetime(value)
+    if moment.tzinfo is not None:
+        return moment.strftime("%Y-%m-%d %H:%M:%S %Z")
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def default_markdown_name(region, generated_at=None):
+    """Default report file name: `bms-list-<region>-<YYYYMMDD>.md`."""
+    stamp = _as_datetime(generated_at).strftime("%Y%m%d")
+    return "bms-list-%s-%s.md" % (region, stamp)
+
+
+def _md_cell(value):
+    """Escape a value for a Markdown table cell (pipes / newlines / blanks)."""
+    text = "" if value is None else str(value)
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    text = re.sub(r"\s*\n\s*", " ", text).strip()
+    return text or "-"
+
+
+def render_markdown(region, servers, generated_at=None, filters=None):
+    """Render the BMS inventory as a Markdown report.
+
+    Contains the queried region, the query timestamp, the server total and a
+    fixed inventory table (see `MD_TABLE_COLUMNS`: 名称 / ID / 状态 / 规格 /
+    可用区 / IP). Values are read through `normalize_server`, so nested `flavor`
+    / availability-zone fields are flattened; missing values render as `-` and a
+    missing name falls back to the server ID. Cells are escaped by `_md_cell`.
+    An empty result renders `共 0 个裸金属服务器` instead of an empty table; the
+    filters actually applied are always listed when present.
+    """
+    filters = list(filters or [])
+    servers = list(servers or [])
+    lines = [
+        "# Huawei Cloud BMS 裸金属服务器清单",
+        "",
+        "- **Region**: %s" % region,
+        "- **查询时间**: %s" % format_query_time(generated_at),
+        "- **主机总数**: %d" % len(servers),
+    ]
+    if filters:
+        lines.append("- **过滤条件**: %s" % ", ".join(filters))
+    lines.extend(["", "## 裸金属服务器清单", ""])
+    if not servers:
+        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
+        lines.append("共 0 个裸金属服务器%s" % suffix)
+    else:
+        lines.append("| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS))
+        lines.append("| %s |" % " | ".join("---" for _ in MD_TABLE_COLUMNS))
+        for server in servers:
+            flat = normalize_server(server)
+            name = _field(flat, "name", "server_name", default=None)
+            if name is None:
+                name = _field(flat, "id", "server_id")
+            cells = []
+            for key, _ in MD_TABLE_COLUMNS:
+                value = name if key == "name" else _field(flat, key)
+                cells.append(_md_cell(value))
+            lines.append("| %s |" % " | ".join(cells))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_markdown_file(path, content):
+    """Write `content` to `path` (UTF-8) and return the absolute path.
+
+    The report is written to a temporary sibling first and moved into place, so
+    a failure (missing directory / no permission) never leaves a truncated half
+    file behind. Missing parent directories are deliberately *not* created —
+    the caller gets an explicit `OutputError` instead.
+    """
+    target = os.path.abspath(os.path.expanduser(str(path)))
+    directory = os.path.dirname(target) or os.getcwd()
+    tmp_path = None
+    try:
+        handle_fd, tmp_path = tempfile.mkstemp(
+            prefix=".bms-list-", suffix=".md.tmp", dir=directory)
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, target)
+    except OSError as exc:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise OutputError("无法写入 Markdown 文件 %s: %s" % (target, exc))
+    return target
+
+
 def _cell(value):
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -584,6 +730,11 @@ def main(argv=None):
                         dest="page_size", help="分页大小/每页条数（默认 %d，上限 1000）" % DEFAULT_PAGE_SIZE)
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
                         help="hcloud BMS 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+    parser.add_argument("--md-file", "--output-md", dest="md_file",
+                        nargs="?", const="", default=None, metavar="PATH",
+                        help="额外把清单写入 Markdown 文件（叠加在 stdout 输出之上）；"
+                             "不带路径时写入默认文件名 bms-list-<region>-<YYYYMMDD>.md；"
+                             "不指定本参数时不生成任何文件")
     args = parser.parse_args(argv)
 
     raw_argv = argv if argv is not None else sys.argv[1:]
@@ -611,28 +762,34 @@ def main(argv=None):
 
     if args.as_json:
         print(json.dumps(servers, ensure_ascii=False, indent=2))
-        return 0
-
-    if args.names_only:
+    elif args.names_only:
         print("Region %s 的 BMS 裸金属服务器名称列表（共 %d 个）：" % (args.region, len(servers)))
         for name in server_names(servers):
             print("- %s" % name)
-        return 0
-
-    if not servers:
-        filters = []
-        if args.status:
-            filters.append("status=%s" % args.status)
-        if args.name:
-            filters.append("name=%s" % args.name)
-        if args.server_id:
-            filters.append("server_id=%s" % args.server_id)
+    elif not servers:
+        filters = active_filter_descriptions(
+            status=args.status, name=args.name, server_id=args.server_id)
         suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
         print("当前区域（%s）无裸金属服务器%s。" % (args.region, suffix))
-        return 0
+    else:
+        print("Region %s 的 BMS 裸金属服务器列表（共 %d 个，完整字段）："
+              % (args.region, len(servers)))
+        print(render_table(servers))
 
-    print("Region %s 的 BMS 裸金属服务器列表（共 %d 个，完整字段）：" % (args.region, len(servers)))
-    print(render_table(servers))
+    if args.md_file is not None:
+        # `--md-file` without a value (`args.md_file == ""`) picks the default
+        # file name; the Markdown export is additive to every stdout mode.
+        filters = active_filter_descriptions(
+            status=args.status, name=args.name, server_id=args.server_id)
+        md_path = args.md_file or default_markdown_name(args.region)
+        markdown = render_markdown(args.region, servers, filters=filters)
+        try:
+            absolute_path = write_markdown_file(md_path, markdown)
+        except BmsListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        print("已生成 Markdown 文件：%s" % absolute_path)
+
     return 0
 
 
