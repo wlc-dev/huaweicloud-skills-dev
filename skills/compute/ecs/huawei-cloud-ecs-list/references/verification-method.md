@@ -29,6 +29,8 @@ python3 scripts/list_ecs.py --json | python3 -m json.tool >/dev/null        # JS
 python3 scripts/list_ecs.py --names-only                                    # compact inventory
 python3 scripts/list_ecs.py --status ACTIVE                                 # server-side filter
 python3 scripts/list_ecs.py --name ecs-web                                  # server-side filter
+python3 scripts/list_ecs.py --txt-file /tmp/ecs-inventory.txt               # additive TXT export
+python3 scripts/list_ecs.py --txt-file                                      # default TXT file name
 ```
 
 ## REST path provenance

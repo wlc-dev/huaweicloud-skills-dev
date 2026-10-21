@@ -4,15 +4,17 @@
 Primary execution path is KooCLI; when hcloud is not installed, the script falls
 back to the official `huaweicloudsdkecs` v2 SDK (`list_servers_details`). Reads
 nothing but the active credential profile / environment. Supports three stdout
-modes (table / --json / --names-only) plus an additive Markdown file export
-(--md-file / --output-md), --status / --name server-side filters, offset
-paging, and a strict write-intent guard: any argument that looks like a
-mutating ECS operation is rejected before a single command is executed.
+modes (table / --json / --names-only) plus additive Markdown and TXT file
+exports (--md-file / --output-md and --txt-file / --output-txt),
+--status / --name server-side filters, offset paging, and a strict
+write-intent guard: any argument that looks like a mutating ECS operation is
+rejected before a single command is executed.
 
 Usage:
     python3 scripts/list_ecs.py [--region cn-north-4] [--json | --names-only]
-                                 [--md-file [PATH]] [--status ACTIVE]
-                                 [--name ecs-web] [--page-size 100]
+                                 [--md-file [PATH]] [--txt-file [PATH]]
+                                 [--status ACTIVE] [--name ecs-web]
+                                 [--page-size 100]
                                  [--operation ListServersDetails]
 
 Environment overrides (mostly for tests):
@@ -89,9 +91,10 @@ WRITE_INTENT_KEYWORDS = (
 # value is intentionally NOT excluded: it is validated by `guard_operation()`
 # and also scanned, as defense in depth.
 #
-# `--md-file` / `--output-md` take a *local output path*, not a cloud operation:
-# a report name such as `ecs-delete-report.md` or `ecs-start-report.md` is pure
-# file-system data and must not trip the guard either.
+# `--md-file` / `--output-md` (and `--txt-file` / `--output-txt`) take a *local
+# output path*, not a cloud operation: a report name such as
+# `ecs-delete-report.md` or `ecs-start-report.txt` is pure file-system data and
+# must not trip the guard either.
 _VALUE_STRIPPED_FLAGS = (
     "--region",
     "-r",
@@ -100,6 +103,8 @@ _VALUE_STRIPPED_FLAGS = (
     "--page-size",
     "--md-file",
     "--output-md",
+    "--txt-file",
+    "--output-txt",
 )
 
 # Preferred column order for the table view; remaining keys are appended sorted.
@@ -378,12 +383,27 @@ def _has_more(batch, collected, limit, payload):
     return len(batch) >= limit
 
 
-def _env_credential(markers):
-    for key, value in os.environ.items():
-        upper = key.upper()
-        if not upper.startswith(("HUAWEI", "HW_", "HWC")):
-            continue
-        if any(marker in upper for marker in markers) and value:
+# Whitelisted credential environment variables — read by name only, never by
+# enumerating os.environ (avoids harvesting unrelated environment variables).
+_AK_ENV_NAMES = (
+    "HW_ACCESS_KEY",
+    "HUAWEI_ACCESS_KEY",
+    "HUAWEICLOUD_SDK_AK",
+    "HUAWEI_CLOUD_ACCESS_KEY",
+)
+_SK_ENV_NAMES = (
+    "HW_SECRET_KEY",
+    "HUAWEI_SECRET_KEY",
+    "HUAWEICLOUD_SDK_SK",
+    "HUAWEI_CLOUD_SECRET_KEY",
+)
+
+
+def _env_value(names):
+    """Read the first non-empty value from an explicit whitelist of env names."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
             return value
     return None
 
@@ -427,8 +447,8 @@ def list_servers_via_sdk(region, status=None, name=None,
     """SDK fallback: query servers through `huaweicloudsdkecs` v2.
 
     Only invoked when hcloud is not installed. Credentials are taken from the
-    standard environment variables (HUAWEI_*/HW_*/HWC_* AK/SK markers) — never
-    passed as literals here. The official SDK has no env-var auto-discovery on
+    whitelisted AK/SK environment variables (HW_*/HUAWEI_ACCESS_KEY family) —
+    never passed as literals here. The official SDK has no env-var auto-discovery on
     `BasicCredentials()`, so AK/SK must be read explicitly. Region resolution
     uses the SDK's own `EcsRegion` catalog (official endpoints, no guessing),
     falling back to an explicit `Region(id, endpoint)` for custom regions.
@@ -446,12 +466,13 @@ def list_servers_via_sdk(region, status=None, name=None,
             "huaweicloudsdkecs。详情：%s" % exc
         )
 
-    ak = _env_credential(("ACCESS_KEY", "_AK"))
-    sk = _env_credential(("SECRET_KEY", "_SK"))
+    ak = _env_value(_AK_ENV_NAMES)
+    sk = _env_value(_SK_ENV_NAMES)
     if not ak or not sk:
         raise ConfigError(
             "SDK 回退缺少 AK/SK 凭证：官方 SDK 的 BasicCredentials 不会自动读取环境"
-            "变量，且当前环境未检测到 HUAWEI_*/HW_*/HWC_* 形式的 AK/SK 环境变量。"
+            "变量，且当前环境未检测到 HW_ACCESS_KEY / HUAWEI_ACCESS_KEY / "
+            "HUAWEICLOUD_SDK_AK 形式的 AK/SK 环境变量。"
             "请在会话外设置 HUAWEI_ACCESS_KEY / HUAWEI_SECRET_KEY（严禁在对话中粘贴"
             " AK/SK），参见 references/cli-installation-guide.md。"
         )
@@ -724,6 +745,93 @@ def write_markdown_file(path, content):
     return target
 
 
+def default_txt_name(region, generated_at=None):
+    """Default report file name: `ecs-list-<region>-<YYYYMMDD>.txt`."""
+    stamp = _as_datetime(generated_at).strftime("%Y%m%d")
+    return "ecs-list-%s-%s.txt" % (region, stamp)
+
+
+def _txt_cell(value):
+    """Render a value for a plain-text report cell (newlines folded, blank → `-`).
+
+    Pure text carries no Markdown escaping; only embedded newlines are folded
+    to a single space so each instance stays on one line.
+    """
+    text = "" if value is None else str(value)
+    text = re.sub(r"\s*\n\s*", " ", text).strip()
+    return text or "-"
+
+
+def render_txt(region, servers, generated_at=None, filters=None):
+    """Render the ECS inventory as a plain-text (TXT) report.
+
+    Mirrors `render_markdown` field-for-field (same `MD_TABLE_COLUMNS` set and
+    the same `normalize_server` / `_field` lookups), but emits plain text with
+    a fixed `  |  ` column separator and no Markdown syntax: Region, query
+    timestamp, instance total, then the inventory lines
+    (名称 | ID | 状态 | 规格 | vCPU | 内存 | 可用区 | 私网IP | 公网IP). An empty
+    result renders `共 0 个实例` (+ the filters actually applied); missing values
+    render as `-`.
+    """
+    filters = list(filters or [])
+    servers = list(servers or [])
+    lines = [
+        "Huawei Cloud ECS 实例清单",
+        "",
+        "Region: %s" % region,
+        "查询时间: %s" % format_query_time(generated_at),
+        "实例总数: %d" % len(servers),
+    ]
+    if filters:
+        lines.append("过滤条件: %s" % ", ".join(filters))
+    lines.extend(["", "实例清单", ""])
+    if not servers:
+        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
+        lines.append("共 0 个实例%s" % suffix)
+    else:
+        lines.append(" | ".join(label for _, label in MD_TABLE_COLUMNS))
+        for server in servers:
+            flat = normalize_server(server)
+            name = _field(flat, "name", "instance_name", default=None)
+            if name is None:
+                name = _field(flat, "id", "server_id")
+            cells = []
+            for key, _ in MD_TABLE_COLUMNS:
+                value = name if key == "name" else _field(flat, key)
+                cells.append(_txt_cell(value))
+            lines.append(" | ".join(cells))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_txt_file(path, content):
+    """Write `content` to `path` (UTF-8) and return the absolute path.
+
+    Same atomic strategy as `write_markdown_file`: the report is written to a
+    temporary sibling first and moved into place with `os.replace`, so a
+    failure (missing directory / no permission) never leaves a truncated half
+    file behind. Missing parent directories are deliberately *not* created —
+    the caller gets an explicit `OutputError` instead.
+    """
+    target = os.path.abspath(os.path.expanduser(str(path)))
+    directory = os.path.dirname(target) or os.getcwd()
+    tmp_path = None
+    try:
+        handle_fd, tmp_path = tempfile.mkstemp(
+            prefix=".ecs-list-", suffix=".txt.tmp", dir=directory)
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, target)
+    except OSError as exc:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise OutputError("无法写入 TXT 文件 %s: %s" % (target, exc))
+    return target
+
+
 def _cell(value):
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -773,6 +881,11 @@ def main(argv=None):
                         nargs="?", const="", default=None, metavar="PATH",
                         help="额外把清单写入 Markdown 文件（叠加在 stdout 输出之上）；"
                              "不带路径时写入默认文件名 ecs-list-<region>-<YYYYMMDD>.md；"
+                             "不指定本参数时不生成任何文件")
+    parser.add_argument("--txt-file", "--output-txt", dest="txt_file",
+                        nargs="?", const="", default=None, metavar="PATH",
+                        help="额外把清单写入纯文本 TXT 文件（叠加在 stdout 输出之上）；"
+                             "不带路径时写入默认文件名 ecs-list-<region>-<YYYYMMDD>.txt；"
                              "不指定本参数时不生成任何文件")
 
     # Write-intent guard runs on the RAW argv before argparse, so that a
@@ -828,6 +941,18 @@ def main(argv=None):
             print("[错误] %s" % exc, file=sys.stderr)
             return 1
         print("已生成 Markdown 文件：%s" % absolute_path)
+
+    if args.txt_file is not None:
+        # `--txt-file` without a value (`args.txt_file == ""`) picks the default
+        # file name; the TXT export is additive to every stdout mode.
+        txt_path = args.txt_file or default_txt_name(args.region)
+        text = render_txt(args.region, servers, filters=filters)
+        try:
+            absolute_path = write_txt_file(txt_path, text)
+        except EcsListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        print("已生成 TXT 文件：%s" % absolute_path)
 
     return 0
 
