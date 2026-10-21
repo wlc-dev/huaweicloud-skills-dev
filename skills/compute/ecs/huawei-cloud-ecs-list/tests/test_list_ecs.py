@@ -23,6 +23,7 @@ from list_ecs import (  # noqa: E402
     build_command,
     classify_hcloud_failure,
     default_markdown_name,
+    default_txt_name,
     extract_servers,
     extract_json,
     format_query_time,
@@ -35,10 +36,12 @@ from list_ecs import (  # noqa: E402
     normalize_server,
     render_markdown,
     render_table,
+    render_txt,
     sdk_server_to_dict,
     server_names,
     server_summary_lines,
     write_markdown_file,
+    write_txt_file,
 )
 
 SERVER_1 = {
@@ -170,6 +173,27 @@ class TestWriteIntentGuard(unittest.TestCase):
             guard_text_from_argv(["--md-file", "ecs-delete-report.md"])))
         self.assertFalse(guard_write_intent(
             guard_text_from_argv(["--md-file", "ecs-restart-report.md"])))
+
+    def test_guard_text_strips_txt_file_values(self):
+        # Same exemption as --md-file: the TXT output path is file-system data.
+        self.assertEqual(
+            guard_text_from_argv(["--txt-file", "ecs-delete-report.txt"]), "")
+        self.assertEqual(
+            guard_text_from_argv(["--txt-file=ecs-delete-report.txt"]), "")
+        self.assertEqual(
+            guard_text_from_argv(["--output-txt", "ecs-stop-report.txt"]), "")
+        # Optional value: a following *flag* is still scanned.
+        self.assertIn("--create-server",
+                      guard_text_from_argv(["--txt-file", "--create-server"]))
+        self.assertIn("DeleteServers",
+                      guard_text_from_argv(["--txt-file", "--operation",
+                                            "DeleteServers"]))
+
+    def test_txt_file_path_with_write_words_not_blocked(self):
+        self.assertFalse(guard_write_intent(
+            guard_text_from_argv(["--txt-file", "ecs-delete-report.txt"])))
+        self.assertFalse(guard_write_intent(
+            guard_text_from_argv(["--output-txt", "ecs-start-report.txt"])))
 
 
 class TestBuildCommand(unittest.TestCase):
@@ -439,10 +463,17 @@ class TestSdkFallbackFix(unittest.TestCase):
         self.addCleanup(self._builder_patch.stop)
 
     def _clean_credential_env(self):
-        return {
-            key: value for key, value in os.environ.items()
-            if not key.upper().startswith(("HUAWEI", "HW_", "HWC"))
-        }
+        credential_vars = (
+            "HW_ACCESS_KEY",
+            "HUAWEI_ACCESS_KEY",
+            "HUAWEICLOUD_SDK_AK",
+            "HUAWEI_CLOUD_ACCESS_KEY",
+            "HW_SECRET_KEY",
+            "HUAWEI_SECRET_KEY",
+            "HUAWEICLOUD_SDK_SK",
+            "HUAWEI_CLOUD_SECRET_KEY",
+        )
+        return {name: "" for name in credential_vars}
 
     def test_official_sdk_imports_resolve(self):
         from huaweicloudsdkcore.auth.credentials import BasicCredentials
@@ -949,6 +980,265 @@ class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
         for exc in (GuardError, ConfigError, AuthError, ApiError, OutputError):
             self.assertTrue(issubclass(exc, EcsListError))
+
+
+class TestTxtReport(unittest.TestCase):
+    """render_txt / default_txt_name (offline, no file system)."""
+
+    def test_render_contains_region_time_total_and_inventory(self):
+        txt = render_txt("cn-north-4", [SERVER_1, SERVER_2],
+                         datetime.datetime(2026, 10, 20, 9, 30, 0))
+        self.assertIn("Huawei Cloud ECS 实例清单", txt)
+        self.assertIn("Region: cn-north-4", txt)
+        self.assertIn("查询时间: 2026-10-20 09:30:00", txt)
+        self.assertIn("实例总数: 2", txt)
+        self.assertIn("实例清单", txt)
+        # Header uses the same fixed column set as the Markdown export.
+        header = " | ".join(label for _, label in MD_TABLE_COLUMNS)
+        self.assertIn(header, txt)
+
+    def test_render_generated_at_defaults_to_now(self):
+        txt = render_txt("cn-north-4", [SERVER_1])
+        self.assertRegex(txt, r"查询时间: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+    def test_render_data_rows_and_separator(self):
+        txt = render_txt("cn-north-4", [SERVER_1, SERVER_2],
+                         datetime.datetime(2026, 10, 20))
+        self.assertIn(
+            "ecs-web-01 | ecs-0001 | ACTIVE | s6.large.2 | 2 | 4096 | "
+            "cn-north-4a | 192.168.0.10 | -", txt)
+        self.assertIn(
+            "ecs-db-02 | ecs-0002 | SHUTOFF | s6.xlarge.2 | 4 | 8192 | "
+            "cn-north-4b | 192.168.0.11 | 10.0.0.5", txt)
+
+    def test_render_name_falls_back_to_id(self):
+        txt = render_txt("cn-north-4", [{"id": "ecs-9"}],
+                         datetime.datetime(2026, 10, 20))
+        self.assertIn("ecs-9 | ecs-9 | - | - | - | - | - | - | -", txt)
+
+    def test_render_empty_list_message_and_filters(self):
+        txt = render_txt("cn-south-1", [], datetime.datetime(2026, 10, 20),
+                         filters=["status=ACTIVE", "name=ecs-web"])
+        self.assertIn("实例总数: 0", txt)
+        self.assertIn("过滤条件: status=ACTIVE, name=ecs-web", txt)
+        self.assertIn("共 0 个实例", txt)
+        self.assertIn("（过滤条件: status=ACTIVE, name=ecs-web）", txt)
+        self.assertNotIn("实例名称", txt)
+
+    def test_render_empty_list_without_filters(self):
+        txt = render_txt("cn-south-1", [], datetime.datetime(2026, 10, 20))
+        self.assertIn("共 0 个实例", txt)
+        self.assertNotIn("过滤条件", txt)
+
+    def test_render_folds_newlines_and_keeps_plain_text(self):
+        # Pure text carries no Markdown escaping: a pipe stays literal, while a
+        # newline is folded so an instance stays on a single line.
+        txt = render_txt("cn-north-4", [{"id": "ecs|1", "name": "web\n01"}],
+                         datetime.datetime(2026, 10, 20))
+        self.assertIn("web 01 | ecs|1 | -", txt)
+        self.assertNotIn("\\|", txt)
+
+    def test_render_multi_value_ips_comma_joined(self):
+        server = {
+            "id": "ecs-multi",
+            "name": "ecs-multi",
+            "addresses": {
+                "vpc-subnet": [
+                    {"addr": "192.168.0.20", "OS-EXT-IPS:type": "fixed"},
+                    {"addr": "192.168.0.21", "OS-EXT-IPS:type": "fixed"},
+                ]
+            },
+        }
+        txt = render_txt("cn-north-4", [server], datetime.datetime(2026, 10, 20))
+        self.assertIn("192.168.0.20,192.168.0.21", txt)
+
+    def test_default_name_uses_region_and_date(self):
+        self.assertEqual(
+            default_txt_name("cn-north-4",
+                             datetime.datetime(2026, 10, 20, 23, 59)),
+            "ecs-list-cn-north-4-20261020.txt")
+        self.assertEqual(
+            default_txt_name("cn-south-1", datetime.datetime(2026, 1, 2)),
+            "ecs-list-cn-south-1-20260102.txt")
+
+
+class TestTxtFileWrite(unittest.TestCase):
+    """write_txt_file: UTF-8, atomic, no half file on failure."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ecs-txt-write-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def test_writes_utf8_and_returns_absolute_path(self):
+        target = os.path.join(self.dir, "out.txt")
+        path = write_txt_file(target, "实例清单\ntext\n")
+        self.assertEqual(path, os.path.abspath(target))
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "实例清单\ntext\n")
+        # No temporary sibling left behind.
+        self.assertEqual(os.listdir(self.dir), ["out.txt"])
+
+    def test_overwrites_existing_report(self):
+        target = os.path.join(self.dir, "out.txt")
+        write_txt_file(target, "old")
+        write_txt_file(target, "new")
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "new")
+
+    def test_missing_directory_raises_and_leaves_nothing(self):
+        target = os.path.join(self.dir, "nope", "out.txt")
+        with self.assertRaises(OutputError) as ctx:
+            write_txt_file(target, "x")
+        self.assertIn("无法写入 TXT 文件", str(ctx.exception))
+        self.assertFalse(os.path.exists(target))
+        self.assertFalse(os.path.exists(os.path.dirname(target)))
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_unwritable_target_raises_and_leaves_no_temp(self):
+        # A directory as the target makes the final move fail everywhere.
+        target = os.path.join(self.dir, "target-dir")
+        os.mkdir(target)
+        with self.assertRaises(OutputError) as ctx:
+            write_txt_file(target, "x")
+        self.assertIn("无法写入 TXT 文件", str(ctx.exception))
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(os.listdir(self.dir), ["target-dir"])
+
+
+class TestMainTxtOutput(unittest.TestCase):
+    """`main()` end-to-end for --txt-file / --output-txt (mocked hcloud)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ecs-txt-main-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._cwd = os.getcwd()
+        self.addCleanup(os.chdir, self._cwd)
+        os.chdir(self.dir)
+
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_ecs.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    @staticmethod
+    def _page(servers):
+        return [(json.dumps({"servers": servers, "count": len(servers)}), "", 0)]
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_explicit_path_creates_report_and_hints_absolute_path(self):
+        target = os.path.join(self.dir, "inventory.txt")
+        rc, out, err = self._run(
+            ["--txt-file", target], self._page([SERVER_1, SERVER_2]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(os.path.isfile(target))
+        content = self._read(target)
+        header = " | ".join(label for _, label in MD_TABLE_COLUMNS)
+        for fragment in ("Region: cn-north-4", "查询时间:", "实例总数: 2",
+                         header,
+                         "ecs-web-01 | ecs-0001 | ACTIVE | s6.large.2 | 2 | "
+                         "4096 | cn-north-4a | 192.168.0.10 | -"):
+            self.assertIn(fragment, content)
+        self.assertIn(os.path.abspath(target), out)
+        # The default stdout table is still printed (additive, not exclusive).
+        self.assertIn("ECS 实例列表", out)
+
+    def test_no_value_uses_default_file_name(self):
+        rc, out, err = self._run(["--txt-file"], self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        expected = "ecs-list-cn-north-4-%s.txt" % datetime.date.today().strftime("%Y%m%d")
+        self.assertEqual(os.listdir(self.dir), [expected])
+        self.assertIn(os.path.abspath(expected), out)
+        self.assertIn("ecs-web-01 | ecs-0001 |", self._read(expected))
+
+    def test_no_value_uses_requested_region_in_default_name(self):
+        rc, out, err = self._run(["-r", "cn-south-1", "--txt-file"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        expected = "ecs-list-cn-south-1-%s.txt" % datetime.date.today().strftime("%Y%m%d")
+        self.assertEqual(os.listdir(self.dir), [expected])
+        self.assertIn("Region: cn-south-1", self._read(expected))
+
+    def test_output_txt_alias(self):
+        rc, out, err = self._run(["--output-txt", "alias.txt"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "alias.txt")))
+
+    def test_path_with_write_words_not_blocked(self):
+        rc, out, err = self._run(["--txt-file=ecs-delete-report.txt"],
+                                 self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("写操作意图", err)
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.dir, "ecs-delete-report.txt")))
+
+    def test_empty_list_report_exits_zero(self):
+        rc, out, err = self._run(["--status", "ACTIVE", "--txt-file", "empty.txt"],
+                                 self._page([]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        content = self._read(os.path.join(self.dir, "empty.txt"))
+        self.assertIn("共 0 个实例", content)
+        self.assertIn("status=ACTIVE", content)
+        self.assertIn("实例总数: 0", content)
+        # stdout behaviour for an empty list is unchanged.
+        self.assertIn("无 ECS 实例", out)
+
+    def test_write_failure_reports_error_and_exits_one(self):
+        target = os.path.join(self.dir, "absent-dir", "out.txt")
+        rc, out, err = self._run(["--txt-file", target], self._page([SERVER_1]))
+        self.assertEqual(rc, 1)
+        self.assertIn("[错误]", err)
+        self.assertIn("无法写入 TXT 文件", err)
+        self.assertFalse(os.path.exists(target))
+        self.assertFalse(os.path.exists(os.path.dirname(target)))
+        # No half file / temp sibling anywhere.
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_json_mode_unchanged_and_no_file_without_flag(self):
+        rc, out, err = self._run(["--json"], self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [SERVER_1])
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_names_only_txt_is_additive(self):
+        rc, out, err = self._run(["--names-only", "--txt-file", "inv.txt"],
+                                 self._page([SERVER_1, SERVER_2]))
+        self.assertEqual(rc, 0)
+        self.assertIn("ecs-web-01  (id: ecs-0001)", out)
+        self.assertIn("ecs-db-02 | ecs-0002 |",
+                      self._read(os.path.join(self.dir, "inv.txt")))
+
+    def test_txt_and_md_and_json_all_stacked(self):
+        rc, out, err = self._run(
+            ["--json", "--md-file", "out.md", "--txt-file", "out.txt"],
+            self._page([SERVER_1]))
+        self.assertEqual(rc, 0)
+        # stdout mode (JSON) is unchanged; the file-path hints are appended
+        # after it, exactly like the existing additive Markdown export.
+        self.assertEqual(json.loads(out.split("已生成")[0]), [SERVER_1])
+        self.assertIn("已生成 Markdown 文件", out)
+        self.assertIn("已生成 TXT 文件", out)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["out.md", "out.txt"])
+        self.assertIn("ecs-web-01 | ecs-0001 |",
+                      self._read(os.path.join(self.dir, "out.txt")))
+
+    def test_txt_written_before_write_intent_still_blocked(self):
+        rc, out, err = self._run(["--txt-file", "out.txt", "--operation",
+                                  "DeleteServers"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("写操作意图", err)
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 if __name__ == "__main__":
