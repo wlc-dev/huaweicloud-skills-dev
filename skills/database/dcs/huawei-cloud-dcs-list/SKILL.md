@@ -26,7 +26,7 @@ description: |
      "查询缓存实例", "DCS inventory", "list cache instances", "华为云 DCS 列表".
   7. Offline unit tests (mocked hcloud subprocess) cover output modes, filters,
      paging, error scenarios, SDK fallback, and the write-intent guard.
-tags: [huawei-cloud, dcs, redis, memcached, database, readonly, koo-cli]
+tags: [huawei-cloud, dcs, database, readonly, koo-cli]
 ---
 
 # Huawei Cloud DCS Instance List
