@@ -13,20 +13,8 @@
 | 9 | Missing AK/SK explicit hint (exit 1) | ✅ `ConfigError` |
 | 10 | No write API call exists in code; write intents blocked by guard before execution | ✅ `guard_write_intent` / `guard_operation` |
 | 11 | SDK fallback (`huaweicloudsdkecs`) when hcloud is missing | ✅ `list_servers_via_sdk` |
-| 12 | Offline unit tests with mocked hcloud, all passing | ✅ 119 tests |
+| 12 | Offline unit tests with mocked hcloud, all passing (SDK-optional cases skipped when `huaweicloudsdkecs` is absent) | ✅ 66 tests |
 | 13 | Read-only REST path provenance documented | ✅ verification-method.md |
 | 14 | SKILL.md ≤ 500 lines, files ≤ 30, size ≤ 40 MB, extension allowlist | ✅ |
-| 15 | `--md-file <PATH>` / `--output-md <PATH>` writes a valid Markdown report with Region, 查询时间, 实例总数 and a `实例名称 \| 实例 ID` table | ✅ `render_markdown` / `write_markdown_file` |
-| 16 | `--md-file` without a value writes the default `ecs-list-<region>-<YYYYMMDD>.md` | ✅ `default_markdown_name` |
-| 17 | Markdown export is additive — default table / `--json` / `--names-only` stdout behaviour is unchanged | ✅ `main()` output branches |
-| 18 | Empty list → report contains 「共 0 个实例」 (+ active filters) and exits 0 | ✅ |
-| 19 | Successful write prints the report's absolute path on stdout | ✅ `已生成 Markdown 文件：<abs path>` |
-| 20 | Write failure (missing directory / unwritable target) → explicit 「无法写入 Markdown 文件」 hint, exit 1, no half file and no temp sibling left behind | ✅ `OutputError` + temp-file-then-rename |
-| 21 | Report path containing `delete` / `start` / `stop` is not blocked by the write-intent guard (single-value flags are exempt, a following flag is still scanned) | ✅ `_VALUE_STRIPPED_FLAGS` + guard regression tests |
-| 22 | `--txt-file <PATH>` / `--output-txt <PATH>` writes a UTF-8 plain-text report with Region, 查询时间, 实例总数 and the 名称·ID·状态·规格·vCPU·内存·可用区·私网IP·公网IP inventory | ✅ `render_txt` / `write_txt_file` |
-| 23 | `--txt-file` without a value writes the default `ecs-list-<region>-<YYYYMMDD>.txt` | ✅ `default_txt_name` |
-| 24 | TXT export is additive — stdout (table / `--json` / `--names-only`) is unchanged; may be stacked with `--md-file` | ✅ `main()` output branches |
-| 25 | Empty list → TXT contains 「共 0 个实例」 (+ active filters) and exits 0 | ✅ |
-| 26 | Successful TXT write prints the report's absolute path on stdout | ✅ `已生成 TXT 文件：<abs path>` |
-| 27 | TXT write failure (missing directory / unwritable target) → explicit 「无法写入 TXT 文件」 hint, exit 1, no half file and no temp sibling left behind | ✅ `OutputError` + temp-file-then-rename |
-| 28 | TXT path containing `delete` / `start` / `stop` is not blocked by the write-intent guard | ✅ `_VALUE_STRIPPED_FLAGS` + guard regression tests |
+| 15 | Stdout-only: the script writes no file in any output mode | ✅ no write path in code |
+| 16 | Read-only filter values (`--status` / `--name` / `--region` / `--page-size`) are not scanned by the write-intent guard, while a following flag is still scanned | ✅ `_VALUE_STRIPPED_FLAGS` + guard regression tests |

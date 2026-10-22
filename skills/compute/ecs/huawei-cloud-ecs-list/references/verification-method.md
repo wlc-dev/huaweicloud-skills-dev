@@ -21,16 +21,26 @@ python3 -m unittest discover -s tests -v
 
 ## Live verification (when credentials exist)
 
+The skill's entry point is the script; each command below exercises the
+KooCLI path (or the SDK fallback) end-to-end:
+
 ```bash
-hcloud configure list                                                       # profile check
-hcloud ECS ListServersDetails --cli-region=cn-north-4 --limit=1             # API sanity
-python3 scripts/list_ecs.py --region cn-north-4                             # full flow
-python3 scripts/list_ecs.py --json | python3 -m json.tool >/dev/null        # JSON validity
-python3 scripts/list_ecs.py --names-only                                    # compact inventory
-python3 scripts/list_ecs.py --status ACTIVE                                 # server-side filter
-python3 scripts/list_ecs.py --name ecs-web                                  # server-side filter
-python3 scripts/list_ecs.py --txt-file /tmp/ecs-inventory.txt               # additive TXT export
-python3 scripts/list_ecs.py --txt-file                                      # default TXT file name
+python3 scripts/list_ecs.py --region cn-north-4
+python3 scripts/list_ecs.py --json
+python3 scripts/list_ecs.py --names-only
+python3 scripts/list_ecs.py --status ACTIVE
+python3 scripts/list_ecs.py --name ecs-web
+```
+
+The script prints to stdout only; it never writes a file. To check JSON
+validity, pipe the `--json` output to `python3 -m json.tool` manually.
+
+For reference, the raw KooCLI invocations the script wraps internally
+(illustrative — require KooCLI installed):
+
+```text
+hcloud configure list
+hcloud ECS ListServersDetails --cli-region=cn-north-4 --limit=1
 ```
 
 ## REST path provenance

@@ -4,7 +4,7 @@
 
 Official quick start: https://support.huaweicloud.com/qs-hcli/hcli_02_003.html
 
-```bash
+```text
 # Linux/macOS
 curl -sSL https://cn-north-4-res.hcccloud.com/cli/latest/install.sh -o install.sh
 bash install.sh
@@ -16,13 +16,14 @@ hcloud version
 The skill script never reads, echoes, or stores AK/SK — authentication is fully
 delegated to the active KooCLI profile. Configure it in your own terminal:
 
-```bash
-hcloud configure  # interactive; never paste AK/SK into an agent chat
+```text
+# interactive; never paste AK/SK into an agent chat
+hcloud configure
 ```
 
 Verify (read-only, no secrets echoed):
 
-```bash
+```text
 hcloud configure list
 ```
 
@@ -39,7 +40,7 @@ chat or literals.
 
 ## Used by this skill
 
-```bash
+```text
 hcloud ECS ListServersDetails --cli-region=cn-north-4 --limit=100 --offset=0
 ```
 

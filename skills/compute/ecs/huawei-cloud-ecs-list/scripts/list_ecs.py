@@ -4,15 +4,13 @@
 Primary execution path is KooCLI; when hcloud is not installed, the script falls
 back to the official `huaweicloudsdkecs` v2 SDK (`list_servers_details`). Reads
 nothing but the active credential profile / environment. Supports three stdout
-modes (table / --json / --names-only) plus additive Markdown and TXT file
-exports (--md-file / --output-md and --txt-file / --output-txt),
---status / --name server-side filters, offset paging, and a strict
-write-intent guard: any argument that looks like a mutating ECS operation is
-rejected before a single command is executed.
+modes (table / --json / --names-only), --status / --name server-side filters,
+offset paging, and a strict write-intent guard: any argument that looks like a
+mutating ECS operation is rejected before a single command is executed. Output
+goes to stdout only — the script never writes a file.
 
 Usage:
     python3 scripts/list_ecs.py [--region cn-north-4] [--json | --names-only]
-                                 [--md-file [PATH]] [--txt-file [PATH]]
                                  [--status ACTIVE] [--name ecs-web]
                                  [--page-size 100]
                                  [--operation ListServersDetails]
@@ -28,8 +26,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
-from datetime import datetime
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
@@ -90,21 +86,12 @@ WRITE_INTENT_KEYWORDS = (
 # `--status REBUILD` / `--status RESIZE` would be rejected. The `--operation`
 # value is intentionally NOT excluded: it is validated by `guard_operation()`
 # and also scanned, as defense in depth.
-#
-# `--md-file` / `--output-md` (and `--txt-file` / `--output-txt`) take a *local
-# output path*, not a cloud operation: a report name such as
-# `ecs-delete-report.md` or `ecs-start-report.txt` is pure file-system data and
-# must not trip the guard either.
 _VALUE_STRIPPED_FLAGS = (
     "--region",
     "-r",
     "--status",
     "--name",
     "--page-size",
-    "--md-file",
-    "--output-md",
-    "--txt-file",
-    "--output-txt",
 )
 
 # Preferred column order for the table view; remaining keys are appended sorted.
@@ -125,23 +112,6 @@ PREFERRED_COLUMNS = [
     "enterprise_project_id",
     "tags",
     "host_id",
-]
-
-# Fixed column subset (key, Chinese header) used by the Markdown inventory
-# table. Reuses the leading `PREFERRED_COLUMNS` keys so the report shows the
-# most useful ECS attributes instead of only name/ID. Multi-value fields such
-# as the private/public IPs are already comma-joined by `normalize_server`;
-# missing values render as `-` through `_md_cell`.
-MD_TABLE_COLUMNS = [
-    ("name", "实例名称"),
-    ("id", "实例 ID"),
-    ("status", "状态"),
-    ("flavor", "规格"),
-    ("vcpus", "vCPU"),
-    ("ram", "内存"),
-    ("availability_zone", "可用区"),
-    ("privateIps", "私网IP"),
-    ("publicIps", "公网IP"),
 ]
 
 _SERVER_LIST_KEYS = ("servers", "server_list", "servers_detail", "serverInfos")
@@ -197,10 +167,6 @@ class ApiError(EcsListError):
     """hcloud / network / unexpected API failure."""
 
 
-class OutputError(EcsListError):
-    """The Markdown report could not be written (bad directory / permission)."""
-
-
 def guard_write_intent(text):
     """Raise GuardError if `text` carries a mutating intent.
 
@@ -231,15 +197,13 @@ def guard_text_from_argv(argv):
     """Build the text the write-intent guard should scan.
 
     Scans flag names and positional tokens, but strips the values of the
-    read-only filter flags (`--status` / `--name` / `--region` / `--page-size`)
-    and of the local-output flag (`--md-file` / `--output-md`): those are pure
-    read / file-path data and may legitimately contain write-looking words
-    (e.g. the ECS status value `REBUILD`, an instance named `restart-me`, or a
-    report path such as `ecs-delete-report.md`).
+    read-only filter flags (`--status` / `--name` / `--region` / `--page-size`):
+    those are pure read data and may legitimately contain write-looking words
+    (e.g. the ECS status value `REBUILD` or an instance named `restart-me`).
 
-    A *flag* following such an option is never swallowed: `--md-file` takes an
-    optional value, so skipping the next token unconditionally would let
-    `--md-file --create-server` hide a mutating flag from the guard.
+    A *flag* following such an option is never swallowed: skipping the next
+    token unconditionally would let `--status --create-server` hide a mutating
+    flag from the guard.
     """
     tokens = list(argv if argv is not None else sys.argv[1:])
     kept = []
@@ -408,6 +372,33 @@ def _env_value(names):
     return None
 
 
+def to_jsonable(value):
+    """Recursively convert `value` into JSON-serializable primitives.
+
+    The official `huaweicloudsdkecs` model `to_dict()` does not recurse into
+    every container: a `ServerDetail.addresses` value is a *dict of lists* of
+    `ServerAddress` model objects, and the objects inside those inner lists
+    survive `to_dict()` untouched. Such objects are not JSON-serializable and
+    crash `json.dumps` (TypeError: Object of type ServerAddress is not JSON
+    serializable). This helper normalizes any nested structure: SDK models are
+    converted via their own `to_dict()`, containers are rebuilt element-wise,
+    and anything else non-primitive degrades to `str()` (never raises).
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {key: to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_jsonable(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return to_jsonable(to_dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 def sdk_server_to_dict(server):
     """Convert a `huaweicloudsdkecs` ServerDetail into wire-name-keyed dict.
 
@@ -435,10 +426,10 @@ def sdk_server_to_dict(server):
     attr_keys = set(attr_map.keys())
     for attr, wire in attr_map.items():
         if attr in raw and raw[attr] is not None:
-            out[wire] = raw[attr]
+            out[wire] = to_jsonable(raw[attr])
     for key, value in raw.items():
         if key not in attr_keys and key not in out and value is not None:
-            out[key] = value
+            out[key] = to_jsonable(value)
     return out
 
 
@@ -645,196 +636,15 @@ def active_filter_descriptions(status=None, name=None):
     return filters
 
 
-def _as_datetime(value):
-    """Return `value` as a datetime, defaulting to the current local time."""
-    if isinstance(value, datetime):
-        return value
-    return datetime.now().astimezone()
-
-
-def format_query_time(value=None):
-    """Format the query timestamp for the Markdown header (local time + zone)."""
-    moment = _as_datetime(value)
-    if moment.tzinfo is not None:
-        return moment.strftime("%Y-%m-%d %H:%M:%S %Z")
-    return moment.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def default_markdown_name(region, generated_at=None):
-    """Default report file name: `ecs-list-<region>-<YYYYMMDD>.md`."""
-    stamp = _as_datetime(generated_at).strftime("%Y%m%d")
-    return "ecs-list-%s-%s.md" % (region, stamp)
-
-
-def _md_cell(value):
-    """Escape a value for a Markdown table cell (pipes / newlines / blanks)."""
-    text = "" if value is None else str(value)
-    text = text.replace("\\", "\\\\").replace("|", "\\|")
-    text = re.sub(r"\s*\n\s*", " ", text).strip()
-    return text or "-"
-
-
-def render_markdown(region, servers, generated_at=None, filters=None):
-    """Render the ECS inventory as a Markdown report.
-
-    Contains the queried region, the query timestamp, the instance total and a
-    multi-column inventory table (see `MD_TABLE_COLUMNS`: name / ID / status /
-    flavor / vCPU / memory / availability zone / private IPs / public IPs).
-    Values are read through `normalize_server`, so nested `flavor` / `addresses`
-    / AZ fields are flattened and multi-value IP lists are comma-joined; missing
-    values render as `-`. Cells are escaped by `_md_cell`. An empty result
-    renders `共 0 个实例` instead of an empty table; the filters actually applied
-    are always listed when present.
-    """
-    filters = list(filters or [])
-    servers = list(servers or [])
-    lines = [
-        "# Huawei Cloud ECS 实例清单",
-        "",
-        "- **Region**: %s" % region,
-        "- **查询时间**: %s" % format_query_time(generated_at),
-        "- **实例总数**: %d" % len(servers),
-    ]
-    if filters:
-        lines.append("- **过滤条件**: %s" % ", ".join(filters))
-    lines.extend(["", "## 实例清单", ""])
-    if not servers:
-        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
-        lines.append("共 0 个实例%s" % suffix)
-    else:
-        lines.append("| %s |" % " | ".join(label for _, label in MD_TABLE_COLUMNS))
-        lines.append("| %s |" % " | ".join("---" for _ in MD_TABLE_COLUMNS))
-        for server in servers:
-            flat = normalize_server(server)
-            name = _field(flat, "name", "instance_name", default=None)
-            if name is None:
-                name = _field(flat, "id", "server_id")
-            cells = []
-            for key, _ in MD_TABLE_COLUMNS:
-                value = name if key == "name" else _field(flat, key)
-                cells.append(_md_cell(value))
-            lines.append("| %s |" % " | ".join(cells))
-    lines.append("")
-    return "\n".join(lines)
-
-
-def write_markdown_file(path, content):
-    """Write `content` to `path` (UTF-8) and return the absolute path.
-
-    The report is written to a temporary sibling first and moved into place, so
-    a failure (missing directory / no permission) never leaves a truncated half
-    file behind. Missing parent directories are deliberately *not* created —
-    the caller gets an explicit `OutputError` instead.
-    """
-    target = os.path.abspath(os.path.expanduser(str(path)))
-    directory = os.path.dirname(target) or os.getcwd()
-    tmp_path = None
-    try:
-        handle_fd, tmp_path = tempfile.mkstemp(
-            prefix=".ecs-list-", suffix=".md.tmp", dir=directory)
-        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_path, target)
-    except OSError as exc:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        raise OutputError("无法写入 Markdown 文件 %s: %s" % (target, exc))
-    return target
-
-
-def default_txt_name(region, generated_at=None):
-    """Default report file name: `ecs-list-<region>-<YYYYMMDD>.txt`."""
-    stamp = _as_datetime(generated_at).strftime("%Y%m%d")
-    return "ecs-list-%s-%s.txt" % (region, stamp)
-
-
-def _txt_cell(value):
-    """Render a value for a plain-text report cell (newlines folded, blank → `-`).
-
-    Pure text carries no Markdown escaping; only embedded newlines are folded
-    to a single space so each instance stays on one line.
-    """
-    text = "" if value is None else str(value)
-    text = re.sub(r"\s*\n\s*", " ", text).strip()
-    return text or "-"
-
-
-def render_txt(region, servers, generated_at=None, filters=None):
-    """Render the ECS inventory as a plain-text (TXT) report.
-
-    Mirrors `render_markdown` field-for-field (same `MD_TABLE_COLUMNS` set and
-    the same `normalize_server` / `_field` lookups), but emits plain text with
-    a fixed `  |  ` column separator and no Markdown syntax: Region, query
-    timestamp, instance total, then the inventory lines
-    (名称 | ID | 状态 | 规格 | vCPU | 内存 | 可用区 | 私网IP | 公网IP). An empty
-    result renders `共 0 个实例` (+ the filters actually applied); missing values
-    render as `-`.
-    """
-    filters = list(filters or [])
-    servers = list(servers or [])
-    lines = [
-        "Huawei Cloud ECS 实例清单",
-        "",
-        "Region: %s" % region,
-        "查询时间: %s" % format_query_time(generated_at),
-        "实例总数: %d" % len(servers),
-    ]
-    if filters:
-        lines.append("过滤条件: %s" % ", ".join(filters))
-    lines.extend(["", "实例清单", ""])
-    if not servers:
-        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
-        lines.append("共 0 个实例%s" % suffix)
-    else:
-        lines.append(" | ".join(label for _, label in MD_TABLE_COLUMNS))
-        for server in servers:
-            flat = normalize_server(server)
-            name = _field(flat, "name", "instance_name", default=None)
-            if name is None:
-                name = _field(flat, "id", "server_id")
-            cells = []
-            for key, _ in MD_TABLE_COLUMNS:
-                value = name if key == "name" else _field(flat, key)
-                cells.append(_txt_cell(value))
-            lines.append(" | ".join(cells))
-    lines.append("")
-    return "\n".join(lines)
-
-
-def write_txt_file(path, content):
-    """Write `content` to `path` (UTF-8) and return the absolute path.
-
-    Same atomic strategy as `write_markdown_file`: the report is written to a
-    temporary sibling first and moved into place with `os.replace`, so a
-    failure (missing directory / no permission) never leaves a truncated half
-    file behind. Missing parent directories are deliberately *not* created —
-    the caller gets an explicit `OutputError` instead.
-    """
-    target = os.path.abspath(os.path.expanduser(str(path)))
-    directory = os.path.dirname(target) or os.getcwd()
-    tmp_path = None
-    try:
-        handle_fd, tmp_path = tempfile.mkstemp(
-            prefix=".ecs-list-", suffix=".txt.tmp", dir=directory)
-        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_path, target)
-    except OSError as exc:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        raise OutputError("无法写入 TXT 文件 %s: %s" % (target, exc))
-    return target
-
-
 def _cell(value):
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, (dict, list, tuple)):
+        # Normalize first: a container may still hold a non-serializable SDK
+        # model object (defense in depth — the SDK path already normalizes).
+        try:
+            return json.dumps(to_jsonable(value), ensure_ascii=False,
+                              separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(value)
     return str(value)
 
 
@@ -877,23 +687,12 @@ def main(argv=None):
                         dest="page_size", help="分页大小（默认 %d）" % DEFAULT_PAGE_SIZE)
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
                         help="hcloud ECS 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
-    parser.add_argument("--md-file", "--output-md", dest="md_file",
-                        nargs="?", const="", default=None, metavar="PATH",
-                        help="额外把清单写入 Markdown 文件（叠加在 stdout 输出之上）；"
-                             "不带路径时写入默认文件名 ecs-list-<region>-<YYYYMMDD>.md；"
-                             "不指定本参数时不生成任何文件")
-    parser.add_argument("--txt-file", "--output-txt", dest="txt_file",
-                        nargs="?", const="", default=None, metavar="PATH",
-                        help="额外把清单写入纯文本 TXT 文件（叠加在 stdout 输出之上）；"
-                             "不带路径时写入默认文件名 ecs-list-<region>-<YYYYMMDD>.txt；"
-                             "不指定本参数时不生成任何文件")
 
     # Write-intent guard runs on the RAW argv before argparse, so that a
     # mutating flag (e.g. `--create-server`) is reported as a guard violation
     # instead of an argparse "unrecognized argument" error. Filter *values*
     # (status/name) are read-only data and deliberately not scanned — they may
-    # contain write-looking words (e.g. the ECS status `REBUILD`), and so may
-    # the local report path (`--md-file ecs-delete-report.md`).
+    # contain write-looking words (e.g. the ECS status `REBUILD`).
     try:
         guard_write_intent(guard_text_from_argv(argv))
     except EcsListError as exc:
@@ -918,7 +717,9 @@ def main(argv=None):
     filter_suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
 
     if args.as_json:
-        print(json.dumps(servers, ensure_ascii=False, indent=2))
+        # Normalize before serialization: never leak an SDK model object
+        # (e.g. ServerAddress nested in `addresses`) into json.dumps.
+        print(json.dumps(to_jsonable(servers), ensure_ascii=False, indent=2))
     elif args.names_only:
         print("Region %s 的 ECS 实例清单（共 %d 个）：" % (args.region, len(servers)))
         for line in server_summary_lines(servers):
@@ -929,30 +730,6 @@ def main(argv=None):
         print("Region %s 的 ECS 实例列表（共 %d 个，完整字段）："
               % (args.region, len(servers)))
         print(render_table(servers))
-
-    if args.md_file is not None:
-        # `--md-file` without a value (`args.md_file == ""`) picks the default
-        # file name; the Markdown export is additive to every stdout mode.
-        md_path = args.md_file or default_markdown_name(args.region)
-        markdown = render_markdown(args.region, servers, filters=filters)
-        try:
-            absolute_path = write_markdown_file(md_path, markdown)
-        except EcsListError as exc:
-            print("[错误] %s" % exc, file=sys.stderr)
-            return 1
-        print("已生成 Markdown 文件：%s" % absolute_path)
-
-    if args.txt_file is not None:
-        # `--txt-file` without a value (`args.txt_file == ""`) picks the default
-        # file name; the TXT export is additive to every stdout mode.
-        txt_path = args.txt_file or default_txt_name(args.region)
-        text = render_txt(args.region, servers, filters=filters)
-        try:
-            absolute_path = write_txt_file(txt_path, text)
-        except EcsListError as exc:
-            print("[错误] %s" % exc, file=sys.stderr)
-            return 1
-        print("已生成 TXT 文件：%s" % absolute_path)
 
     return 0
 
