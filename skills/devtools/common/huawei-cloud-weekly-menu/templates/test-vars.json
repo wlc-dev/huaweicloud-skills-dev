@@ -1,0 +1,48 @@
+{
+  "skill_name": "huawei-cloud-weekly-menu",
+  "region": "cn-north-4",
+  "test_cases": [
+    {
+      "id": "TC-01",
+      "name": "Argument help (syntax)",
+      "command": "python3 scripts/generate_weekly_menu.py --help",
+      "expected": "argparse help printed, exit 0; contains --seed/--days/--meals/--format",
+      "type": "syntax",
+      "executor": "script"
+    },
+    {
+      "id": "TC-02",
+      "name": "Default 7-day Markdown menu with a fixed seed",
+      "command": "python3 scripts/generate_weekly_menu.py --seed 20240501 --format markdown",
+      "expected": "Markdown menu with Day 1..Day 7 and Breakfast/Lunch/Dinner for each day",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-03",
+      "name": "Plain-text menu output",
+      "command": "python3 scripts/generate_weekly_menu.py --seed 42 --format text",
+      "expected": "Plain-text weekly menu, one dish per meal slot",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-04",
+      "name": "Custom days and meals",
+      "command": "python3 scripts/generate_weekly_menu.py --seed 7 --days 2 --meals breakfast,dinner --format markdown",
+      "expected": "Only Day 1 and Day 2, only Breakfast and Dinner",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-05",
+      "name": "Reproducible output for the same seed",
+      "command": "python3 scripts/generate_weekly_menu.py --seed 555 --format json",
+      "expected": "JSON week object; identical for repeated runs with the same seed",
+      "type": "readonly",
+      "executor": "script"
+    }
+  ],
+  "env_vars_required": [],
+  "notes": "Pure local Python 3 skill: no Huawei Cloud credentials, CLI, SDK, or network access. All cases are read-only and only read the built-in dish library. When the smoke harness cannot execute interpreter commands, the structural self-check plus the unit tests under tests/ cover the behaviour."
+}
