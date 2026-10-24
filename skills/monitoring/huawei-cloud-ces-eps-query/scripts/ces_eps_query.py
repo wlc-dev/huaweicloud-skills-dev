@@ -25,6 +25,12 @@ Execution order is KooCLI (`hcloud`) first, then the official SDK
 fallback. Every path is strictly read-only; a write-intent guard rejects
 mutating intents before any command runs.
 
+Every `hcloud` invocation on the CLI path is wrapped with `skill-quality-cli`
+(`skill-quality-cli run --skill-name huawei-cloud-ces-eps-query -- hcloud ...`)
+for quality telemetry; when the CLI is unavailable the path degrades to bare
+`hcloud` and the CLI→SDK→REST fallback contract is unchanged. Disable telemetry
+with `SKILL_QUALITY_REPORT=0`.
+
 Explicitly OUT OF SCOPE (never executed by this skill): raw metric data points
 (`ShowMetricData` / `ListMetrics` / `BatchListMetricData`), service-level metric
 values (RDS / DCS / DMS / EVS / ELB ...), and every write operation
@@ -42,12 +48,20 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 50
 HCLOUD_TIMEOUT = 120
+
+# Skill-quality telemetry: every hcloud call on the script execution path is
+# reported through skill-quality-cli (the mandatory wrapping口径). When the CLI
+# is unavailable the path degrades to bare hcloud without changing the
+# CLI→SDK→REST fallback contract.
+SKILL_QUALITY_SKILL_NAME = "huawei-cloud-ces-eps-query"
+_QUALITY_OFF_VALUES = ("0", "false", "no", "off")
 
 # --------------------------------------------------------------------------
 # Category registry (authoritative: SDK method + resource_path from
@@ -411,6 +425,61 @@ def _hcloud_executable():
     return os.environ.get("CES_EPS_HCLOUD_BIN", "hcloud")
 
 
+def _quality_report_enabled():
+    """Quality telemetry is on unless SKILL_QUALITY_REPORT is set to a falsy value."""
+    value = os.environ.get("SKILL_QUALITY_REPORT")
+    if value is None:
+        return True
+    return value.strip().lower() not in _QUALITY_OFF_VALUES
+
+
+def _skill_quality_executable():
+    """Locate skill-quality-cli: env override → PATH → ~/.local/bin, else None."""
+    override = os.environ.get("CES_EPS_SQC_BIN")
+    if override:
+        return override
+    found = shutil.which("skill-quality-cli")
+    if found:
+        return found
+    local = os.path.join(os.path.expanduser("~"), ".local", "bin",
+                         "skill-quality-cli")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return None
+
+
+def _hcloud_argv(argv):
+    """Bare hcloud argv: CES_EPS_HCLOUD_BIN override + extra args + argv."""
+    cmd = [_hcloud_executable()]
+    extra = os.environ.get("CES_EPS_HCLOUD_ARGS", "").split()
+    if extra:
+        cmd.extend(extra)
+    cmd.extend(argv)
+    return cmd
+
+
+def build_hcloud_command(argv):
+    """Build the hcloud execution argv, wrapping it with skill-quality-cli.
+
+    Every CLI call is reported as ``skill-quality-cli run --skill-name
+    huawei-cloud-ces-eps-query -- hcloud ...`` (the skill's mandatory wrapping
+    口径, enforced here on the script path rather than left to the agent). The
+    command degrades to bare hcloud when the telemetry CLI is missing or
+    ``SKILL_QUALITY_REPORT=0``; an explicit ``CES_EPS_HCLOUD_BIN`` override
+    (offline mock / verification) is always run verbatim.
+    """
+    hcloud_cmd = _hcloud_argv(argv)
+    if os.environ.get("CES_EPS_HCLOUD_BIN"):
+        return hcloud_cmd
+    if not _quality_report_enabled():
+        return hcloud_cmd
+    quality_cli = _skill_quality_executable()
+    if not quality_cli:
+        return hcloud_cmd
+    return ([quality_cli, "run", "--skill-name", SKILL_QUALITY_SKILL_NAME, "--"]
+            + hcloud_cmd)
+
+
 def build_cli_command(category, region, limit, offset, params=None):
     """Build the `hcloud <Service> <Operation> --cli-region=<region> ...` argv."""
     spec = CATEGORIES[category]
@@ -429,12 +498,12 @@ def build_cli_command(category, region, limit, offset, params=None):
 
 
 def run_hcloud(argv):
-    """Execute hcloud and return (stdout, stderr, returncode)."""
-    cmd = [_hcloud_executable()]
-    extra = os.environ.get("CES_EPS_HCLOUD_ARGS", "").split()
-    if extra:
-        cmd.extend(extra)
-    cmd.extend(argv)
+    """Execute hcloud through skill-quality-cli when available.
+
+    Returns ``(stdout, stderr, returncode)``; the CLI→SDK→REST fallback contract
+    is unchanged.
+    """
+    cmd = build_hcloud_command(argv)
     try:
         proc = subprocess.run(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

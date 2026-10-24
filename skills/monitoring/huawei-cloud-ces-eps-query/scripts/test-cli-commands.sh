@@ -286,10 +286,16 @@ try:
     from huaweicloudsdkcore.http.http_config import HttpConfig
     svc_module = __import__('huaweicloudsdk' + svc_lower + '.v1', fromlist=[svc + 'Client'])
     Client = getattr(svc_module, svc + 'Client')
-    ak = (os.environ.get('HUAWEICLOUD_SDK_AK') or os.environ.get('HUAWEI_ACCESS_KEY')
-          or os.environ.get('HW_ACCESS_KEY') or os.environ.get('HUAWEI_AK') or os.environ.get('HW_AK') or '')
-    sk = (os.environ.get('HUAWEICLOUD_SDK_SK') or os.environ.get('HUAWEI_SECRET_KEY')
-          or os.environ.get('HW_SECRET_KEY') or os.environ.get('HUAWEI_SK') or os.environ.get('HW_SK') or '')
+    def _env_first(names):
+        for _name in names:
+            _value = os.environ.get(_name)
+            if _value:
+                return _value
+        return ''
+    ak = _env_first(('HUAWEICLOUD_SDK_AK', 'HUAWEI_ACCESS_KEY',
+                     'HW_ACCESS_KEY', 'HUAWEI_AK', 'HW_AK'))
+    sk = _env_first(('HUAWEICLOUD_SDK_SK', 'HUAWEI_SECRET_KEY',
+                     'HW_SECRET_KEY', 'HUAWEI_SK', 'HW_SK'))
     cred = BasicCredentials(ak, sk)
     config = HttpConfig.get_default_config()
     if insecure:

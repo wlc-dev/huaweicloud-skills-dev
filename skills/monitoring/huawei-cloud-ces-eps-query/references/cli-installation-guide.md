@@ -80,8 +80,14 @@ skill-quality-cli upgrade           # manual upgrade (no auto-upgrade)
 
 Disable the telemetry report with `export SKILL_QUALITY_REPORT=0`.
 
-Every `hcloud` call must be wrapped, e.g.:
+`scripts/ces_eps_query.py` wraps every `hcloud` CLI call automatically (not left
+to the agent), executing it as:
 
 ```bash
 skill-quality-cli run --skill-name huawei-cloud-ces-eps-query -- hcloud CES ListAlarmRules --cli-region=cn-north-4 --limit=1
 ```
+
+When `skill-quality-cli` is not installed the CLI path degrades to bare `hcloud`
+(no telemetry) and the SDK/REST fallback still applies; install it with
+`bash scripts/ensure_cli.sh` to keep reporting. An explicit
+`CES_EPS_HCLOUD_BIN` override (offline mock / verification) is run verbatim.

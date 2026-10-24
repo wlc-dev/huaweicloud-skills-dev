@@ -33,6 +33,8 @@ Coverage:
 | SDK path | Missing-credentials error; success path invokes the correct SDK method with built request kwargs |
 | Backend fallback | CLI success; CLI→SDK fallback when hcloud is absent; ConfigError when no backend is available; required-id validation |
 | Rendering | Table rendering; empty-result message; JSON mode |
+| Quality wrapper | CLI path wraps `hcloud` with `skill-quality-cli run --skill-name … --`; bare fallback when the CLI is missing or `SKILL_QUALITY_REPORT=0`; explicit `CES_EPS_HCLOUD_BIN` override bypasses it |
+| Helper scripts | `ensure_env.py` dependency probing / mirror install / failure paths; `yaml-check-frontmatter.py` OK / ERR / NO_PYYAML paths |
 | main() | `--list-categories`; guard block on write query; unknown-intent error; query routing; JSON output; error path |
 
 ## 3. Functional smoke (creator `test-cli-commands.sh`)
