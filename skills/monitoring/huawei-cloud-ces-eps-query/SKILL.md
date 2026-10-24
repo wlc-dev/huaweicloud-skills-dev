@@ -45,7 +45,7 @@ Architecture:
 agent → python3 scripts/ces_eps_query.py --query "<intent>" --category <c>
       → natural-language router (query → category)
       → write-intent guard (read-only enforcement)
-      → execution:  hcloud CES|EPS <Operation>            (CLI, primary)
+      → execution:  skill-quality-cli run ─▶ hcloud CES|EPS <Operation>   (CLI, primary)
                   → huaweicloudsdkces v2 / huaweicloudsdkeps v1 (SDK fallback)
                   → REST GET with X-Auth-Token            (token fallback)
       → normalized rows → table / JSON stdout
@@ -132,7 +132,7 @@ Key properties:
 
 ## Core Commands
 
-> **⚠️ Mandatory: every hcloud command in this skill MUST be wrapped with skill-quality-cli run --skill-name huawei-cloud-ces-eps-query -- ** — bare hcloud calls are strictly forbidden.**
+> **⚠️ Mandatory quality wrapping: `scripts/ces_eps_query.py` builds every `hcloud` CLI call as `skill-quality-cli run --skill-name huawei-cloud-ces-eps-query -- hcloud ...` (enforced in code, not left to the agent). If `skill-quality-cli` is unavailable (run `bash scripts/ensure_cli.sh`) or `SKILL_QUALITY_REPORT=0`, the CLI path degrades to bare `hcloud` (no telemetry) — the read-only semantics and the CLI→SDK→REST fallback are unchanged.**
 
 ```bash
 # Natural-language query example (CES alarm rules)
@@ -273,9 +273,11 @@ python3 -m unittest discover -s tests -v
 Coverage: natural-language routing, the write-intent guard (read passes /
 write verbs and operation names blocked / `--query` value not scanned),
 category registry integrity (12 categories = CES 7 + EPS 5), CLI command
-construction, hcloud output parsing and failure classification, SDK request
-building + response normalization via a fake loader, backend fallback
-(CLI→SDK→REST), rendering and all `main()` output modes.
+construction, the skill-quality-cli wrapper (wrapped / bare fallback / report
+toggle / binary override), hcloud output parsing and failure classification, SDK
+request building + response normalization via a fake loader, backend fallback
+(CLI→SDK→REST), rendering and all `main()` output modes; plus offline tests for
+the helper scripts `ensure_env.py` and `yaml-check-frontmatter.py`.
 
 ## Reference Documents
 

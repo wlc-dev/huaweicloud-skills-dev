@@ -28,12 +28,14 @@ from ces_eps_query import (  # noqa: E402
     ConfigError,
     EPS_CATEGORIES,
     GuardError,
+    _extract_list_from_payload,
+    _quality_report_enabled,
     build_cli_command,
+    build_hcloud_command,
     build_parser,
     build_sdk_request,
     classify_hcloud_failure,
     classify_query,
-    _extract_list_from_payload,
     extract_json,
     extract_result,
     guard_operation,
@@ -44,6 +46,7 @@ from ces_eps_query import (  # noqa: E402
     query,
     query_via_sdk,
     render_table,
+    run_hcloud,
     to_plain,
 )
 
@@ -482,6 +485,74 @@ class TestMain(unittest.TestCase):
             rc = main(["--category", "alarm-rules"])
         self.assertEqual(rc, 1)
         self.assertIn("boom", buf.getvalue())
+
+
+class TestQualityWrapper(unittest.TestCase):
+    """The CLI path wraps hcloud with skill-quality-cli (with a bare fallback)."""
+
+    def test_wraps_when_cli_available(self):
+        with mock.patch.dict(os.environ, {"CES_EPS_SQC_BIN": "/fake/sqc"}, clear=True):
+            cmd = build_hcloud_command(["CES", "ListAlarmRules"])
+        self.assertEqual(cmd, [
+            "/fake/sqc", "run", "--skill-name", "huawei-cloud-ces-eps-query",
+            "--", "hcloud", "CES", "ListAlarmRules"])
+
+    def test_bare_when_report_disabled(self):
+        env = {"CES_EPS_SQC_BIN": "/fake/sqc", "SKILL_QUALITY_REPORT": "0"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cmd = build_hcloud_command(["CES", "ListAlarmRules"])
+        self.assertEqual(cmd, ["hcloud", "CES", "ListAlarmRules"])
+
+    def test_bare_when_cli_missing(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("ces_eps_query._skill_quality_executable",
+                           return_value=None):
+            cmd = build_hcloud_command(["CES", "ListAlarmRules"])
+        self.assertEqual(cmd, ["hcloud", "CES", "ListAlarmRules"])
+
+    def test_explicit_hcloud_bin_bypasses_wrapper(self):
+        env = {"CES_EPS_SQC_BIN": "/fake/sqc", "CES_EPS_HCLOUD_BIN": "/mock/hcloud"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cmd = build_hcloud_command(["CES", "ListAlarmRules"])
+        self.assertEqual(cmd, ["/mock/hcloud", "CES", "ListAlarmRules"])
+
+    def test_hcloud_extra_args_preserved_inside_wrapper(self):
+        env = {"CES_EPS_SQC_BIN": "/fake/sqc", "CES_EPS_HCLOUD_ARGS": "--debug"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cmd = build_hcloud_command(["EPS", "ListEnterpriseProject"])
+        self.assertEqual(cmd[:5], [
+            "/fake/sqc", "run", "--skill-name", "huawei-cloud-ces-eps-query", "--"])
+        self.assertEqual(cmd[5:],
+                         ["hcloud", "--debug", "EPS", "ListEnterpriseProject"])
+
+    def test_run_hcloud_dispatches_through_wrapper(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return hcloud_result('{"ok": 1}', "", 0)
+
+        with mock.patch.dict(os.environ, {"CES_EPS_SQC_BIN": "/fake/sqc"}, clear=True), \
+                mock.patch("ces_eps_query.subprocess.run", fake_run):
+            stdout, stderr, rc = run_hcloud(["CES", "ListAlarmRules"])
+        self.assertEqual(captured["cmd"][0], "/fake/sqc")
+        self.assertEqual((stdout, stderr, rc), ('{"ok": 1}', "", 0))
+
+    def test_quality_report_default_enabled(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_quality_report_enabled())
+
+    def test_quality_report_falsy_values(self):
+        for value in ("0", "false", "NO", "off"):
+            with mock.patch.dict(os.environ, {"SKILL_QUALITY_REPORT": value},
+                                 clear=True):
+                self.assertFalse(_quality_report_enabled(), value)
+
+    def test_quality_report_truthy_values(self):
+        for value in ("1", "true", "yes"):
+            with mock.patch.dict(os.environ, {"SKILL_QUALITY_REPORT": value},
+                                 clear=True):
+                self.assertTrue(_quality_report_enabled(), value)
 
 
 if __name__ == "__main__":
