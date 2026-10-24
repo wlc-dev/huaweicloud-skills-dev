@@ -14,18 +14,20 @@ python3 -m unittest discover -s tests -v
   SDK modules in `sys.modules`.
 - Cases cover: write-intent guard, command construction (limit/offset, no write
   flags), JSON extraction, failure classification, count-aware paging, SDK
-  fallback, `ShareInfo` attribute remapping, client-side filtering, rendering,
-  and all `main()` output modes.
+  fallback, `ShareInfo` attribute remapping, client-side filtering (incl. AZ),
+  rendering, and all `main()` output modes (table / json / names / count-only).
 
 ## Live verification (when credentials exist)
 
 ```bash
 hcloud configure list                                                # profile present
-hcloud SFS ListShares --cli-region=cn-north-4 --limit=1 --offset=0   # raw API sanity
+hcloud SFSTurbo ListShares --cli-region=cn-north-4 --limit=1 --offset=0   # raw API sanity
 python3 scripts/list_sfs.py --region cn-north-4                      # full flow
 python3 scripts/list_sfs.py --json | python3 -m json.tool            # JSON validity
 python3 scripts/list_sfs.py --names-only                             # compact list
+python3 scripts/list_sfs.py --count-only                              # count only
 python3 scripts/list_sfs.py --share-proto NFS --names-only           # client-side filter
+python3 scripts/list_sfs.py --az cn-north-4a --names-only            # AZ filter
 ```
 
 ## API truth verified from official sources
@@ -40,8 +42,9 @@ python3 scripts/list_sfs.py --share-proto NFS --names-only           # client-si
   `availability_zone` / `az_name`, `share_proto`, `share_type`, `size`,
   `created_at`, `export_location`, `enterprise_project_id`, `vpc_id`,
   `subnet_id`, `security_group_id`, `metadata`.
-- KooCLI operation name `ListShares` and service `SFS` mirror the operation in
-  the official SFS Turbo API reference (「获取文件系统列表」).
+- KooCLI operation name `ListShares` and service `SFSTurbo` mirror the operation
+  in the official SFS Turbo API reference (「获取文件系统列表」); `SFSTurbo` is
+  the registered KooCLI service (`SFS` is not a KooCLI service in 7.3.x).
 
 ## Pass criteria
 

@@ -2,7 +2,7 @@
 
 The skill invokes exactly one SFS operation (both execution paths):
 
-- KooCLI: `hcloud SFS ListShares` — GET `/v1/{project_id}/sfs-turbo/shares/detail`
+- KooCLI: `hcloud SFSTurbo ListShares` — GET `/v1/{project_id}/sfs-turbo/shares/detail`
 - SDK fallback: `huaweicloudsdksfsturbo` v1 `SFSTurboClient.list_shares` (same operation)
 
 Listing file systems is a read-only operation; no `create` / `delete` /

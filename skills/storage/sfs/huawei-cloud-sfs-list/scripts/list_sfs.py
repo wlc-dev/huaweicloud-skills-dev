@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""List Huawei Cloud SFS file systems via KooCLI ``hcloud SFS ListShares`` (read-only).
+"""List Huawei Cloud SFS file systems via KooCLI ``hcloud SFSTurbo ListShares`` (read-only).
 
 Primary execution path is KooCLI; when the hcloud binary is not installed, the
 script falls back to the official ``huaweicloudsdksfsturbo`` v1 SDK
@@ -10,21 +10,23 @@ AK/SK itself.
 
 Supported features:
 
-* Three stdout modes — aligned full-field table (default), ``--json`` (raw
-  response array) and ``--names-only`` (compact name + ID inventory).
+* Four stdout modes — aligned full-field table (default), ``--json`` (raw
+  response array), ``--names-only`` (compact name + ID inventory) and
+  ``--count-only`` (just the number of matching file systems).
 * Read-only query with ``--region`` (default cn-north-4), ``--page-size`` and
   automatic ``limit`` / ``offset`` paging.
-* Client-side ``--name`` / ``--id`` / ``--status`` / ``--share-proto``
-  filtering (the SFS ``ListShares`` request itself only accepts limit/offset —
-  see ``huaweicloudsdksfsturbo.v1.ListSharesRequest``).
+* Client-side ``--name`` / ``--id`` / ``--status`` / ``--share-proto`` /
+  ``--az`` filtering (the SFS ``ListShares`` request itself only accepts
+  limit/offset — see ``huaweicloudsdksfsturbo.v1.ListSharesRequest``).
 * Strict write-intent guard: any mutating SFS intent is rejected before a
   single command is executed.
 
 Usage:
-    python3 scripts/list_sfs.py [--region cn-north-4] [--json | --names-only]
+    python3 scripts/list_sfs.py [--region cn-north-4]
+                                [--json | --names-only | --count-only]
                                 [--name NAME] [--id ID] [--status STATUS]
-                                [--share-proto NFS|CIFS] [--page-size 1000]
-                                [--operation ListShares]
+                                [--share-proto NFS|CIFS] [--az AZ]
+                                [--page-size 200] [--operation ListShares]
 
 Environment overrides (mostly for tests):
     SFS_LIST_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -39,8 +41,12 @@ import subprocess
 import sys
 
 DEFAULT_REGION = "cn-north-4"
-DEFAULT_PAGE_SIZE = 1000
-SERVICE = "SFS"
+# SFS Turbo ListShares rejects limit > 200 (`[USE_ERROR]limit invalid (max 200)`),
+# so the page size is capped and user input is clamped to [MIN_PAGE_SIZE, MAX_PAGE_SIZE].
+DEFAULT_PAGE_SIZE = 200
+MIN_PAGE_SIZE = 1
+MAX_PAGE_SIZE = 200
+SERVICE = "SFSTurbo"
 ALLOWED_OPERATION = "ListShares"
 
 # Mutating SFS intents / operation names — strictly rejected by the guard.
@@ -105,6 +111,7 @@ _VALUE_STRIPPED_FLAGS = (
     "--status",
     "--share-proto",
     "--share-type",
+    "--az",
     "--page-size",
     "--limit",
     "--offset",
@@ -240,8 +247,26 @@ def guard_text_from_argv(argv):
     return " ".join(kept)
 
 
+def clamp_page_size(value):
+    """Clamp a requested page size into the ListShares limit range [1, 200].
+
+    SFS Turbo ``ListShares`` rejects ``limit > 200`` with
+    ``[USE_ERROR]limit invalid (max 200)``; non-numeric input falls back to
+    ``DEFAULT_PAGE_SIZE``.
+    """
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    if size < MIN_PAGE_SIZE:
+        return MIN_PAGE_SIZE
+    if size > MAX_PAGE_SIZE:
+        return MAX_PAGE_SIZE
+    return size
+
+
 def build_command(region, limit=DEFAULT_PAGE_SIZE, offset=0):
-    """Build the hcloud SFS ListShares argv (without the executable).
+    """Build the hcloud SFSTurbo ListShares argv (without the executable).
 
     Mirrors the real KooCLI parameter list: ``--cli-region`` / ``--limit`` /
     ``--offset``. The SFS ``ListShares`` request only carries limit/offset
@@ -313,8 +338,8 @@ def classify_hcloud_failure(stdout, stderr, returncode):
     low = blob.lower()
     if _USE_ERROR_MARKER in low:
         return ApiError(
-            "hcloud 参数错误（KooCLI 拒绝了该参数组合，退出码 %s）：SFS ListShares "
-            "真实参数清单可通过 `hcloud SFS ListShares --help` 查看。详情：%s"
+            "hcloud 参数错误（KooCLI 拒绝了该参数组合，退出码 %s）：SFSTurbo ListShares "
+            "真实参数清单可通过 `hcloud SFSTurbo ListShares --help` 查看。详情：%s"
             % (returncode, blob[:300])
         )
     if any(p in low for p in _CREDENTIAL_MISSING_PATTERNS) and not re.search(
@@ -426,6 +451,7 @@ def list_shares_via_sdk(region, limit=DEFAULT_PAGE_SIZE, max_pages=100):
     ``SFSTurboRegion`` catalog (official endpoints, no guessing), falling back
     to an explicit ``Region(id, endpoint)`` for custom regions.
     """
+    limit = clamp_page_size(limit)
     try:
         from huaweicloudsdkcore.auth.credentials import BasicCredentials
         from huaweicloudsdkcore.region.region import Region
@@ -493,6 +519,7 @@ def list_shares_via_sdk(region, limit=DEFAULT_PAGE_SIZE, max_pages=100):
 
 def list_shares(region, limit=DEFAULT_PAGE_SIZE, max_pages=100):
     """Query all SFS file systems (paged); KooCLI first, SDK fallback."""
+    limit = clamp_page_size(limit)
     shares = []
     offset = 0
     for _page in range(max_pages):
@@ -547,11 +574,11 @@ def normalize_share(share):
 
 
 def filter_shares(shares, name=None, share_id=None, status=None,
-                  share_proto=None):
-    """Apply client-side name / ID / status / protocol filters.
+                  share_proto=None, az=None):
+    """Apply client-side name / ID / status / protocol / AZ filters.
 
     The SFS ``ListShares`` request has no server-side filter parameters, so the
-    requested filtering is applied locally. ``name`` and ``id`` are
+    requested filtering is applied locally. ``name``, ``id`` and ``az`` are
     case-insensitive substring matches; ``status`` and ``share_proto`` are
     case-insensitive exact matches.
     """
@@ -573,6 +600,11 @@ def filter_shares(shares, name=None, share_id=None, status=None,
         result = [s for s in result
                   if str(_field(s, "share_proto", "share_type",
                                 default="")).lower() == needle]
+    if az:
+        needle = str(az).lower()
+        result = [s for s in result
+                  if needle in str(_get(s, "availability_zone", "az_name",
+                                        "az", default="")).lower()]
     return result
 
 
@@ -599,7 +631,7 @@ def share_summary_lines(shares):
 
 
 def active_filter_descriptions(name=None, share_id=None, status=None,
-                               share_proto=None):
+                               share_proto=None, az=None):
     """Human-readable description of the filters actually applied."""
     filters = []
     if name:
@@ -610,6 +642,8 @@ def active_filter_descriptions(name=None, share_id=None, status=None,
         filters.append("status=%s" % status)
     if share_proto:
         filters.append("share_proto=%s" % share_proto)
+    if az:
+        filters.append("az=%s" % az)
     return filters
 
 
@@ -643,23 +677,28 @@ def render_table(shares):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="查询华为云 SFS 文件系统列表（KooCLI hcloud SFS ListShares，只读）。")
+        description="查询华为云 SFS 文件系统列表（KooCLI hcloud SFSTurbo ListShares，只读）。")
     parser.add_argument("-r", "--region", default=DEFAULT_REGION,
                         help="目标 Region（默认 %s）" % DEFAULT_REGION)
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="以 JSON 输出完整原始字段")
     parser.add_argument("--names-only", action="store_true", dest="names_only",
                         help="仅输出精简文件系统名称+ID 清单")
+    parser.add_argument("--count-only", action="store_true", dest="count_only",
+                        help="仅输出匹配的文件系统数量")
     parser.add_argument("--name", help="按文件系统名称过滤（客户端子串匹配）")
     parser.add_argument("--id", help="按文件系统 ID 过滤（客户端子串匹配）")
     parser.add_argument("--status",
                         help="按状态过滤（客户端精确匹配，如 available/creating）")
     parser.add_argument("--share-proto", dest="share_proto",
                         help="按协议过滤（客户端精确匹配：NFS / CIFS）")
+    parser.add_argument("--az", help="按可用区过滤（客户端子串匹配，如 cn-north-4a）")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
-                        dest="page_size", help="分页大小（默认 %d）" % DEFAULT_PAGE_SIZE)
+                        dest="page_size",
+                        help="分页大小（默认 %d，最大 %d；超出将被钳制到 [%d, %d]）"
+                             % (DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, MAX_PAGE_SIZE))
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
-                        help="hcloud SFS 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+                        help="hcloud SFSTurbo 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
 
     # Write-intent guard runs on the RAW argv before argparse so a mutating flag
     # (e.g. `--create-share`) is reported as a guard violation rather than an
@@ -682,13 +721,16 @@ def main(argv=None):
 
     filters = active_filter_descriptions(
         name=args.name, share_id=args.id, status=args.status,
-        share_proto=args.share_proto)
+        share_proto=args.share_proto, az=args.az)
     shares = filter_shares(
         shares, name=args.name, share_id=args.id, status=args.status,
-        share_proto=args.share_proto)
+        share_proto=args.share_proto, az=args.az)
     filter_suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
 
-    if args.as_json:
+    if args.count_only:
+        print("Region %s 的 SFS 文件系统数量：%d%s"
+              % (args.region, len(shares), filter_suffix))
+    elif args.as_json:
         print(json.dumps(shares, ensure_ascii=False, indent=2))
     elif args.names_only:
         print("Region %s 的 SFS 文件系统清单（共 %d 个）：" % (args.region, len(shares)))
