@@ -14,9 +14,11 @@ from list_sfs import (  # noqa: E402
     AuthError,
     ConfigError,
     GuardError,
+    MAX_PAGE_SIZE,
     SfsListError,
     active_filter_descriptions,
     build_command,
+    clamp_page_size,
     classify_hcloud_failure,
     extract_json,
     extract_shares,
@@ -93,6 +95,12 @@ class TestWriteIntentGuard(unittest.TestCase):
         # "--offset" normalizes to "offset" — must not match a write keyword.
         self.assertFalse(guard_write_intent("--offset 20 --limit 10 --status available"))
 
+    def test_az_and_count_flags_do_not_trip(self):
+        # "--az"/"--count-only" values are read-only query data, not intents.
+        self.assertFalse(guard_write_intent(
+            guard_text_from_argv(["--az", "cn-north-4a", "--count-only"])))
+        self.assertFalse(guard_write_intent("--count-only --az cn-north-4a"))
+
     def test_create_blocked(self):
         with self.assertRaises(GuardError):
             guard_write_intent("CreateShare my-fs")
@@ -131,10 +139,10 @@ class TestWriteIntentGuard(unittest.TestCase):
 class TestBuildCommand(unittest.TestCase):
     def test_basic(self):
         argv = build_command("cn-north-4")
-        self.assertEqual(argv[0], "SFS")
+        self.assertEqual(argv[0], "SFSTurbo")
         self.assertEqual(argv[1], "ListShares")
         self.assertIn("--cli-region=cn-north-4", argv)
-        self.assertIn("--limit=1000", argv)
+        self.assertIn("--limit=200", argv)
         self.assertIn("--offset=0", argv)
 
     def test_region_and_offsets(self):
@@ -148,6 +156,35 @@ class TestBuildCommand(unittest.TestCase):
         for flag in argv:
             self.assertFalse(
                 flag.lower().lstrip("-").startswith(("create", "delete", "expand")))
+
+    def test_default_limit_within_api_max(self):
+        # SFS Turbo ListShares rejects limit > 200; the default must be <= 200.
+        self.assertLessEqual(MAX_PAGE_SIZE, 200)
+        self.assertIn("--limit=%d" % MAX_PAGE_SIZE, build_command("cn-north-4"))
+
+    def test_clamp_page_size(self):
+        self.assertEqual(clamp_page_size(1000), 200)
+        self.assertEqual(clamp_page_size(201), 200)
+        self.assertEqual(clamp_page_size(200), 200)
+        self.assertEqual(clamp_page_size(100), 100)
+        self.assertEqual(clamp_page_size(0), 1)
+        self.assertEqual(clamp_page_size(-5), 1)
+        self.assertEqual(clamp_page_size(None), 200)
+        self.assertEqual(clamp_page_size("abc"), 200)
+
+    def test_clamp_applied_in_list_shares(self):
+        fake = FakeRunner([(CLI_OUTPUT_EMPTY, "", 0)])
+        with mock.patch("list_sfs.subprocess.run", fake):
+            list_shares("cn-north-4", limit=5000)
+        limit_arg = next(a for a in fake.calls[0] if a.startswith("--limit="))
+        self.assertEqual(limit_arg, "--limit=200")
+
+    def test_clamp_applied_in_sdk_fallback(self):
+        with mock.patch("list_sfs.subprocess.run", FakeRunner([FileNotFoundError()])), \
+                mock.patch("list_sfs.list_shares_via_sdk",
+                           return_value=[{"name": "sdk-fs"}]) as sdk_mock:
+            list_shares("cn-north-4", limit=999)
+        self.assertEqual(sdk_mock.call_args.kwargs.get("limit"), 200)
 
 
 class TestParsing(unittest.TestCase):
@@ -216,7 +253,7 @@ class TestListShares(unittest.TestCase):
         with mock.patch("list_sfs.subprocess.run", fake):
             shares = list_shares("cn-north-4")
         self.assertEqual([s["name"] for s in shares], ["fs-alpha", "fs-beta"])
-        self.assertEqual(fake.calls[0][0:3], ["hcloud", "SFS", "ListShares"])
+        self.assertEqual(fake.calls[0][0:3], ["hcloud", "SFSTurbo", "ListShares"])
 
     def test_empty(self):
         fake = FakeRunner([(CLI_OUTPUT_EMPTY, "", 0)])
@@ -368,9 +405,25 @@ class TestFiltering(unittest.TestCase):
             [s["name"] for s in filter_shares(self.SHARES, share_proto="nfs")],
             ["fs-prod"])
 
+    def test_filter_by_az(self):
+        shares = [
+            {"name": "a", "availability_zone": "cn-north-4a"},
+            {"name": "b", "az_name": "cn-north-4b"},
+        ]
+        self.assertEqual(
+            [s["name"] for s in filter_shares(shares, az="north-4a")],
+            ["a"])
+        self.assertEqual(
+            [s["name"] for s in filter_shares(shares, az="north-4b")],
+            ["b"])
+
     def test_filter_descriptions(self):
         desc = active_filter_descriptions(name="fs", share_id="a", status="available")
         self.assertEqual(desc, ["name=fs", "id=a", "status=available"])
+
+    def test_filter_descriptions_include_az(self):
+        desc = active_filter_descriptions(name="fs", az="cn-north-4a")
+        self.assertEqual(desc, ["name=fs", "az=cn-north-4a"])
 
 
 class TestRenderAndNames(unittest.TestCase):
@@ -434,6 +487,26 @@ class TestMain(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("fs-alpha", out)
         self.assertNotIn("fs-beta", out)
+
+    def test_az_filter_applied(self):
+        rc, out, err = self._run(["--names-only", "--az", "north-4a"],
+                                 [(CLI_OUTPUT, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("fs-alpha", out)
+        self.assertNotIn("fs-beta", out)
+
+    def test_count_only_output(self):
+        rc, out, err = self._run(["--count-only"], [(CLI_OUTPUT, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("数量：2", out)
+        self.assertNotIn("fs-alpha", out)
+
+    def test_count_only_with_filter(self):
+        rc, out, err = self._run(["--count-only", "--name", "alpha"],
+                                 [(CLI_OUTPUT, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("数量：1", out)
+        self.assertIn("过滤条件", out)
 
     def test_empty_message(self):
         rc, out, err = self._run(["--region", "cn-south-1"],

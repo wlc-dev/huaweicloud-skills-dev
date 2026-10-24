@@ -51,7 +51,7 @@ The SDK fallback reads credentials from the environment (e.g. `HW_ACCESS_KEY` /
 
 ```bash
 hcloud version
-hcloud SFS ListShares --cli-region=cn-north-4 --limit=1 --offset=0
+hcloud SFSTurbo ListShares --cli-region=cn-north-4 --limit=1 --offset=0
 ```
 
 A successful run prints a JSON document with a `shares` array and a `count`
@@ -62,7 +62,7 @@ configure` has not been run.
 ## Used by this skill
 
 ```bash
-hcloud SFS ListShares --cli-region=cn-north-4 --limit=1000 --offset=0
+hcloud SFSTurbo ListShares --cli-region=cn-north-4 --limit=200 --offset=0
 ```
 
 The SFS `ListShares` request accepts only `limit` / `offset`; name / ID /
