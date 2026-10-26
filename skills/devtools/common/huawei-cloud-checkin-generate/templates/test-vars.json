@@ -1,0 +1,48 @@
+{
+  "skill_name": "huawei-cloud-checkin-generate",
+  "region": "cn-north-4",
+  "test_cases": [
+    {
+      "id": "TC-01",
+      "name": "Argument help (syntax)",
+      "command": "python3 scripts/generate_checkin.py --help",
+      "expected": "argparse help printed, exit 0; contains --seed/--date/--format/--data/--output",
+      "type": "syntax",
+      "executor": "script"
+    },
+    {
+      "id": "TC-02",
+      "name": "Default single Markdown record with a fixed seed",
+      "command": "python3 scripts/generate_checkin.py --seed 20240501 --format markdown",
+      "expected": "Markdown table with header 字段|内容 and rows 记录编号/打卡日期/打卡类型/打卡时间/打卡地点/打卡方式/打卡状态/备注",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-03",
+      "name": "Plain-text record output",
+      "command": "python3 scripts/generate_checkin.py --seed 42 --format text",
+      "expected": "Plain-text record, one line per field",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-04",
+      "name": "JSON (machine-readable) output",
+      "command": "python3 scripts/generate_checkin.py --seed 42 --format json",
+      "expected": "Parseable JSON object with seed/explicit_seed/record",
+      "type": "readonly",
+      "executor": "script"
+    },
+    {
+      "id": "TC-05",
+      "name": "Reproducible output for the same seed",
+      "command": "python3 scripts/generate_checkin.py --seed 555 --format json",
+      "expected": "Identical JSON for repeated runs with the same seed",
+      "type": "readonly",
+      "executor": "script"
+    }
+  ],
+  "env_vars_required": [],
+  "notes": "Pure local Python 3 skill: no Huawei Cloud credentials, CLI, SDK, or network access. All cases are read-only and only read the built-in data pool. The smoke harness only executes hcloud/curl commands, so these script cases are reported as not-executed; the structural self-check plus the unit tests under tests/ cover the behaviour."
+}

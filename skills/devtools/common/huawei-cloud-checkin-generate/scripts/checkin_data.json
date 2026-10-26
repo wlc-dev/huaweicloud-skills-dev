@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "description": "Built-in data pool for huawei-cloud-checkin-generate. A check-in record is assembled by combining one entry from each pool: types (with a time window), locations, devices and notes. Pure demo data; it does not represent any real attendance system.",
+  "types": [
+    {"name": "上班打卡", "start": "07:45", "end": "09:55"},
+    {"name": "下班打卡", "start": "17:30", "end": "20:30"},
+    {"name": "外勤打卡", "start": "09:00", "end": "18:00"},
+    {"name": "会议签到", "start": "08:50", "end": "16:30"},
+    {"name": "弹性打卡", "start": "09:30", "end": "11:30"},
+    {"name": "加班打卡", "start": "20:00", "end": "23:30"}
+  ],
+  "locations": [
+    "深圳研发中心 A 座 3 楼",
+    "深圳研发中心 B 座 前台",
+    "北京研究所 1 号楼大厅",
+    "上海研究所 2 号楼门口",
+    "西安研发中心 园区东门",
+    "成都研究所 A 区 5 楼",
+    "杭州研究所 主楼 大堂",
+    "东莞松山湖基地 1 号门",
+    "客户现场（南山科技园）",
+    "客户现场（国贸写字楼）",
+    "居家办公（家庭网络）",
+    "出差酒店（广州天河）"
+  ],
+  "devices": [
+    "手机 App 定位打卡",
+    "企业微信定位打卡",
+    "人脸识别闸机",
+    "工牌刷卡",
+    "电脑客户端打卡",
+    "值守考勤机",
+    "车载 GPS 打卡"
+  ],
+  "notes": [
+    "路况顺畅，正常到岗",
+    "地铁延误，提前出门",
+    "今日在客户现场支持",
+    "参加部门周会，会议签到",
+    "处理线上问题，稍晚离场",
+    "身体不适，申请弹性到岗",
+    "团队聚餐后返回打卡",
+    "上午外出拜访客户，下午回岗",
+    "系统版本发布值守",
+    "远程接入会议，居家办公",
+    "加班完成版本上线",
+    "陪家人就医，申请外勤"
+  ]
+}
