@@ -15,6 +15,7 @@ from list_sfs_export_markdown import (  # noqa: E402
     ConfigError,
     GuardError,
     SfsExportError,
+    active_filter_descriptions,
     build_command,
     classify_hcloud_failure,
     clamp_page_size,
@@ -116,6 +117,14 @@ class TestWriteIntentGuard(unittest.TestCase):
     def test_scrub_drops_name_status_values(self):
         argv = ["--name", "delete-test", "--status", "deleting"]
         self.assertFalse(guard_write_intent(scrub_read_only_values(argv)))
+
+    def test_scrub_drops_id_proto_and_az_values(self):
+        argv = ["--id", "delete-0001", "--share-proto", "NFS",
+                "--az", "expand-zone-a"]
+        scrubbed = scrub_read_only_values(argv)
+        self.assertNotIn("delete-0001", scrubbed)
+        self.assertNotIn("expand-zone-a", scrubbed)
+        self.assertFalse(guard_write_intent(scrubbed))
 
     def test_scrub_drops_flag_equals_value_pairs(self):
         argv = ["--output=/tmp/expand-report.md", "--region=cn-north-4"]
@@ -327,6 +336,38 @@ class TestFilterShares(unittest.TestCase):
     def test_status_exact_ci(self):
         self.assertEqual(filter_shares([SHARE_1, SHARE_2], status="CREATING"), [SHARE_2])
 
+    def test_id_substring_ci(self):
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], share_id="SFS-0002"),
+                         [SHARE_2])
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], share_id="000"),
+                         [SHARE_1, SHARE_2])
+
+    def test_share_proto_exact_ci(self):
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], share_proto="cifs"),
+                         [SHARE_2])
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], share_proto="NFS"),
+                         [SHARE_1])
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], share_proto="SMB"), [])
+
+    def test_az_substring_ci(self):
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], az="4A"), [SHARE_1])
+        self.assertEqual(filter_shares([SHARE_1, SHARE_2], az="4b"), [SHARE_2])
+
+    def test_az_filter_uses_az_name_fallback_key(self):
+        shares = [{"id": "a", "az_name": "cn-south-1a"},
+                  {"id": "b", "availability_zone": "cn-south-1b"}]
+        self.assertEqual(filter_shares(shares, az="south-1a"), [shares[0]])
+
+    def test_all_five_filters_combined(self):
+        self.assertEqual(
+            filter_shares([SHARE_1, SHARE_2], name="demo", share_id="0001",
+                          status="available", share_proto="NFS",
+                          az="north-4a"), [SHARE_1])
+        self.assertEqual(
+            filter_shares([SHARE_1, SHARE_2], name="demo", share_id="0001",
+                          status="available", share_proto="CIFS"),
+            [])
+
     def test_combined(self):
         self.assertEqual(filter_shares([SHARE_1, SHARE_2], name="sfs-demo",
                                        status="available"), [SHARE_1])
@@ -338,6 +379,17 @@ class TestFilterShares(unittest.TestCase):
         source = [SHARE_1, SHARE_2]
         filter_shares(source, name="sfs-demo-01")
         self.assertEqual(source, [SHARE_1, SHARE_2])
+
+
+class TestActiveFilterDescriptions(unittest.TestCase):
+    def test_empty_when_no_filter(self):
+        self.assertEqual(active_filter_descriptions(), [])
+
+    def test_all_filters_ordered(self):
+        self.assertEqual(
+            active_filter_descriptions(name="a", share_id="b", status="c",
+                                       share_proto="d", az="e"),
+            ["name=a", "id=b", "status=c", "share_proto=d", "az=e"])
 
 
 class TestNormalize(unittest.TestCase):
@@ -393,6 +445,33 @@ class TestRenderMarkdown(unittest.TestCase):
         doc = render_markdown([{"name": "a|b", "id": "x\ny"}], "cn-north-4")
         self.assertIn("a\\|b", doc)
         self.assertIn("x y", doc)
+
+    def test_meta_line_without_filters(self):
+        doc = render_markdown([SHARE_1], "cn-north-4")
+        self.assertIn(
+            "> Region: cn-north-4 | File systems: 1 | 无过滤条件", doc)
+
+    def test_meta_line_with_filters(self):
+        doc = render_markdown(
+            [SHARE_1], "cn-north-4",
+            filters=["name=demo", "share_proto=NFS", "az=cn-north-4a"])
+        self.assertIn(
+            "> Region: cn-north-4 | File systems: 1 | "
+            "过滤条件: name=demo, share_proto=NFS, az=cn-north-4a", doc)
+
+    def test_filter_no_match_note(self):
+        doc = render_markdown([], "cn-north-4", filters=["name=nope"],
+                              total_before_filter=2)
+        self.assertIn("当前过滤条件下无匹配的 SFS 文件系统", doc)
+        self.assertIn("过滤条件：name=nope", doc)
+        self.assertNotIn("当前区域（cn-north-4）无 SFS 文件系统", doc)
+        self.assertIn("| 文件系统名称 |", doc)
+        self.assertIn("File systems: 0", doc)
+
+    def test_filter_with_empty_region_keeps_region_note(self):
+        doc = render_markdown([], "cn-south-1", filters=["name=nope"],
+                              total_before_filter=0)
+        self.assertIn("当前区域（cn-south-1）无 SFS 文件系统", doc)
 
 
 class TestWriteMarkdown(unittest.TestCase):
@@ -499,6 +578,83 @@ class TestMain(unittest.TestCase):
                 content = handle.read()
             self.assertIn("sfs-demo-01", content)
             self.assertNotIn("sfs-demo-02", content)
+
+    def test_id_filter_main_client_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.md")
+            fake = FakeRunner([(
+                json.dumps({"shares": [SHARE_1, SHARE_2], "count": 2}), "", 0)])
+            with mock.patch("list_sfs_export_markdown.subprocess.run", fake), \
+                    mock.patch("sys.stdout"):
+                rc = main(["--id", "0002", "--output", path])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("sfs-demo-02", content)
+            self.assertNotIn("sfs-demo-01", content)
+            self.assertIn("过滤条件: id=0002", content)
+            for call in fake.calls:
+                self.assertFalse(any("--id" in part for part in call))
+
+    def test_share_proto_filter_main_client_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "p.md")
+            fake = FakeRunner([(
+                json.dumps({"shares": [SHARE_1, SHARE_2], "count": 2}), "", 0)])
+            with mock.patch("list_sfs_export_markdown.subprocess.run", fake), \
+                    mock.patch("sys.stdout"):
+                rc = main(["--share-proto", "CIFS", "--output", path])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("sfs-demo-02", content)
+            self.assertNotIn("sfs-demo-01", content)
+            for call in fake.calls:
+                self.assertFalse(any("--share-proto" in part for part in call))
+
+    def test_az_filter_main_client_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "az.md")
+            fake = FakeRunner([(
+                json.dumps({"shares": [SHARE_1, SHARE_2], "count": 2}), "", 0)])
+            with mock.patch("list_sfs_export_markdown.subprocess.run", fake), \
+                    mock.patch("sys.stdout"):
+                rc = main(["--az", "cn-north-4A", "--output", path])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("sfs-demo-01", content)
+            self.assertNotIn("sfs-demo-02", content)
+
+    def test_filter_no_match_writes_file_exit_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nomatch.md")
+            rc, out, err = self._run(
+                ["--region", "cn-north-4", "--name", "nope", "--output", path],
+                [(json.dumps({"shares": [SHARE_1, SHARE_2], "count": 2}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(path))
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("当前过滤条件下无匹配的 SFS 文件系统", content)
+            self.assertIn("过滤条件：name=nope", content)
+            self.assertIn("File systems: 0 | 过滤条件: name=nope", content)
+            self.assertNotIn("当前区域（cn-north-4）无 SFS 文件系统", content)
+            self.assertIn("当前过滤条件下无匹配的 SFS 文件系统", out)
+
+    def test_empty_region_with_filter_keeps_region_wording(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.md")
+            rc, out, err = self._run(
+                ["--region", "cn-south-1", "--name", "nope",
+                 "--output", path],
+                [(json.dumps({"shares": [], "count": 0}), "", 0)])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("当前区域（cn-south-1）无 SFS 文件系统", content)
+            self.assertNotIn("当前过滤条件下无匹配", content)
 
     def test_auth_error_message(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,12 +13,16 @@ description: |
      (default `sfs_share_list.md` in the current directory); the parent
      directory is created automatically and the file is written via a temp file
      + atomic rename.
-  3. Region aware: `--region` (default cn-north-4). Optional `--name`
-     (client-side, case-insensitive substring) and `--status` (client-side,
-     exact, case-insensitive) filters — the real ListShares API has no such
-     parameters, so the full paged list is fetched first and filtered locally.
+  3. Region aware: `--region` (default cn-north-4). Optional client-side
+     filters — `--name` / `--id` / `--az` (case-insensitive substring) and
+     `--status` / `--share-proto` (case-insensitive exact) — the real
+     ListShares API has no such parameters, so the full paged list is fetched
+     first and filtered locally. The applied filters are echoed in the
+     document's metadata line (`过滤条件: ...`; `无过滤条件` when none).
   4. Explicit error classification: empty file-system list (still writes the
-     file), missing AK/SK credentials (「缺少 AK/SK 凭证」), 403 / insufficient
+     file — `当前区域（x）无 SFS 文件系统` when the region truly has none,
+     `当前过滤条件下无匹配的 SFS 文件系统` when a filter matched nothing),
+     missing AK/SK credentials (「缺少 AK/SK 凭证」), 403 / insufficient
      IAM permission (「无权限访问 SFS，请检查 IAM 权限」), hcloud not installed
      (falls back to the SDK, else a clear hint), KooCLI usage errors, and
      generic API/network failures.
@@ -164,6 +168,15 @@ python3 scripts/list_sfs_export_markdown.py --region cn-north-4 \
 python3 scripts/list_sfs_export_markdown.py --name sfs-demo --status available \
   --output /tmp/sfs_available.md
 
+# ID / protocol / availability-zone filters (same semantics as the plain list skill)
+python3 scripts/list_sfs_export_markdown.py --id 8be2f1a3 --output /tmp/sfs_one.md
+python3 scripts/list_sfs_export_markdown.py --share-proto NFS --output /tmp/sfs_nfs.md
+python3 scripts/list_sfs_export_markdown.py --az cn-north-4a --output /tmp/sfs_az.md
+
+# Combine filters — the metadata line echoes them
+python3 scripts/list_sfs_export_markdown.py --region cn-south-1 \
+  --share-proto NFS --az cn-south-1a --output /tmp/sfs_south1_nfs.md
+
 # Read-only credential readiness check (wrapped)
 skill-quality-cli run --skill-name huawei-cloud-sfs-export-markdown -- hcloud configure list
 ```
@@ -182,15 +195,29 @@ skill-quality-cli run --skill-name huawei-cloud-sfs-export-markdown -- hcloud SF
 | `--region` / `-r` | No | Huawei Cloud region (default `cn-north-4`) | `cn-south-1` |
 | `--output` / `-o` | No | Markdown output file path (default current dir `sfs_share_list.md`) | `/tmp/sfs.md` |
 | `--name` | No | Filter by file-system name — **applied client-side** (case-insensitive substring; ListShares has no name parameter) | `sfs-prod` |
+| `--id` | No | Filter by file-system ID — **applied client-side** (case-insensitive substring) | `8be2f1a3` |
 | `--status` | No | Filter by file-system state — **applied client-side** (case-insensitive exact: `available` / `creating` / `error`) | `available` |
+| `--share-proto` | No | Filter by share protocol — **applied client-side** (case-insensitive exact: `NFS` / `CIFS`) | `NFS` |
+| `--az` | No | Filter by availability zone — **applied client-side** (case-insensitive substring, `availability_zone` / `az_name` / `az` all considered) | `cn-north-4a` |
 | `--page-size` | No | Page size for ListShares (default `200`, max `200`; values outside `[1, 200]` are clamped) | `100` |
 | `--operation` | No | hcloud SFSTurbo operation name; only `ListShares` is allowed | `ListShares` |
 | `--stdout` | No | Also print the rendered Markdown to stdout (the file is still written) | `--stdout` |
 
 ## Markdown Output Format
 
-The generated document has a title, a short metadata line, and a table with the
-following columns (fields missing on a file system render as `-`):
+The generated document has a title, a metadata block, and a table. The
+metadata line always states the region, the exported row count and the active
+filters:
+
+```markdown
+> Region: cn-north-4 | File systems: 2 | 过滤条件: name=demo, az=cn-north-4a
+```
+
+With no filter supplied the third segment reads `无过滤条件`. Filter order is
+fixed: `name`, `id`, `status`, `share_proto`, `az`.
+
+The table has the following columns (fields missing on a file system render as
+`-`):
 
 | Column (header) | Source key | Notes |
 | ---------- | ---------- | --------- |
@@ -204,8 +231,11 @@ following columns (fields missing on a file system render as `-`):
 | 企业项目 | `enterprise_project_id` | Enterprise project id |
 | 创建时间 | `created_at` | Creation timestamp |
 
-An empty file-system list produces the header + separator followed by a note
-line `_当前区域（<x>）无 SFS 文件系统。_` — the file is always created.
+An empty result still produces the table header + separator and one explicit
+note line, and the file is always created:
+
+- the region genuinely has no file systems → `_当前区域（<x>）无 SFS 文件系统。_`
+- a filter matched nothing → `_当前过滤条件下无匹配的 SFS 文件系统（过滤条件：...）。_`
 
 ## Write-Intent Guard
 
@@ -215,8 +245,8 @@ line `_当前区域（<x>）无 SFS 文件系统。_` — the file is always cre
   `mount`, `unmount`, `attach`, `detach`, `restore`, `reboot`, and SFS operation
   names such as `CreateShare`, `DeleteShare`, `ExpandShare`).
 - Values of read-only flags (the local `--output` path, `--region`, `--name`,
-  `--status`, ...) are excluded from the scan so a file path or filter value is
-  never mistaken for an SFS operation.
+  `--id`, `--status`, `--share-proto`, `--az`, ...) are excluded from the scan so
+  a file path or filter value is never mistaken for an SFS operation.
 - Any hit raises `GuardError`, prints `[错误] 检测到写操作意图 ... 已被守卫拦截`,
   and exits with code 1 **before** a single hcloud command is executed. No write
   operation can be constructed by `build_command()`; there is no code path that
@@ -235,9 +265,9 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 - **Region parameter** — `--cli-region=<value>`, e.g. `--cli-region=cn-north-4`
   (required for every concrete SFS call).
 - **Simple parameter** — `--key=value`, e.g. `--limit=200`, `--offset=20`. SFS
-  Turbo `ListShares` rejects `limit > 200`. There is **no `--name` / `--status`
-  parameter** on the real ListShares API (verified via
-  `hcloud SFSTurbo ListShares --help`); name / status filtering is done
+  Turbo `ListShares` rejects `limit > 200`. There is **no `--name` / `--id` /
+  `--status` / `--share-proto` / `--az` parameter** on the real ListShares API
+  (verified via `hcloud SFSTurbo ListShares --help`); all filtering is done
   client-side by the script.
 - **REST path (official SDK `_http_info`)** —
   `GET /v1/{project_id}/sfs-turbo/shares/detail` (`huaweicloudsdksfsturbo` v1
@@ -256,7 +286,8 @@ production):
 
 | Scenario | Behavior |
 | ---------- | --------- |
-| Empty file-system list / no filter match | Exit 0; the `.md` file is still written (header + `无 SFS 文件系统` note) |
+| Empty file-system list | Exit 0; the `.md` file is still written (header + `当前区域（x）无 SFS 文件系统` note) |
+| Filter matches nothing | Exit 0; the `.md` file is still written with a `当前过滤条件下无匹配的 SFS 文件系统（过滤条件：...）` note |
 | Missing / invalid AK-SK | Exit 1, `缺少 AK/SK 凭证` hint to configure hcloud credentials out-of-band (never in chat); no file written |
 | 403 / insufficient IAM permission | Exit 1, `无权限访问 SFS，请检查 IAM 权限` hint; no file written |
 | hcloud not installed | Falls back to the SDK; if the SDK is unavailable too, exit 1 with a clear hint |
@@ -299,9 +330,11 @@ operation whitelist / read-only value scrubbing incl. `--flag=value`), page
 size clamping, command construction (`--cli-region` / limit / offset, no write
 or filter flags), JSON extraction and file-system extraction, failure
 classification (missing AK/SK, 403, generic, `[USE_ERROR]` with rc=0), offset
-paging (count / full page / empty), client-side name / status filtering, SDK
-fallback (env credentials / missing credentials / unavailable), normalization,
-Markdown rendering (title / header / rows / empty-result note / pipe & newline
+paging (count / full page / empty), client-side name / ID / status / protocol /
+availability-zone filtering, active-filter descriptions, the metadata line with
+and without filters, the two empty-result notes (region empty vs filter no
+match), SDK fallback (env credentials / missing credentials / unavailable),
+normalization, Markdown rendering (title / header / rows / pipe & newline
 escaping), atomic file writing (missing dirs / bad path), and all `main()`
 output modes.
 

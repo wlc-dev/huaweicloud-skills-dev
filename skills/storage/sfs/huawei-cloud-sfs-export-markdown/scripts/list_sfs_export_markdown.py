@@ -18,7 +18,9 @@ unmount / attach / detach / restore intents are refused.
 Usage:
     python3 scripts/list_sfs_export_markdown.py [--region cn-north-4]
                                    [--output sfs_share_list.md]
-                                   [--name sfs-01] [--status available]
+                                   [--name sfs-01] [--id sfs-]
+                                   [--status available] [--share-proto NFS]
+                                   [--az cn-north-4a]
                                    [--page-size 200] [--operation ListShares]
                                    [--stdout]
 
@@ -102,6 +104,7 @@ READ_ONLY_VALUE_FLAGS = frozenset((
     "--output", "-o",
     "--region", "-r",
     "--name",
+    "--id",
     "--status",
     "--share-id",
     "--share-proto",
@@ -511,13 +514,14 @@ def list_shares_via_sdk(region, limit=DEFAULT_PAGE_SIZE, max_pages=100):
     return shares
 
 
-def list_shares(region, status=None, name=None, limit=DEFAULT_PAGE_SIZE,
+def list_shares(region, status=None, name=None, share_id=None,
+                share_proto=None, az=None, limit=DEFAULT_PAGE_SIZE,
                 max_pages=100):
     """Query all SFS file systems (paged); KooCLI first, SDK fallback.
 
-    ``status`` and ``name`` are intentionally NOT forwarded to hcloud or the
-    SDK — the SFS ``ListShares`` request has no such parameters. Instead the
-    full list is fetched first, then client-side filtering is applied by
+    The filters are intentionally NOT forwarded to hcloud or the SDK — the SFS
+    ``ListShares`` request has no such parameters. Instead the full list is
+    fetched first, then client-side filtering is applied by
     ``filter_shares()``.
     """
     limit = clamp_page_size(limit)
@@ -542,7 +546,8 @@ def list_shares(region, status=None, name=None, limit=DEFAULT_PAGE_SIZE,
         offset += len(batch) if batch else limit
     else:
         raise ApiError("翻页超过 %d 页仍未取完，已中止以防死循环。" % max_pages)
-    return filter_shares(shares, name=name, status=status)
+    return filter_shares(shares, name=name, share_id=share_id, status=status,
+                         share_proto=share_proto, az=az)
 
 
 def _get(share, *names, default=None):
@@ -574,24 +579,57 @@ def normalize_share(share):
     return flat
 
 
-def filter_shares(shares, name=None, status=None):
-    """Apply client-side name / status filters.
+def filter_shares(shares, name=None, share_id=None, status=None,
+                  share_proto=None, az=None):
+    """Apply client-side name / ID / status / protocol / AZ filters.
 
     The SFS ``ListShares`` request has no server-side filter parameters, so the
-    requested filtering is applied locally after the full paged query. ``name``
-    is a case-insensitive substring match; ``status`` is a case-insensitive
-    exact match. An empty result is reported as a normal empty list.
+    requested filtering is applied locally after the full paged query. ``name``,
+    ``share_id`` and ``az`` are case-insensitive substring matches; ``status``
+    and ``share_proto`` are case-insensitive exact matches. An empty result is
+    reported as a normal empty list.
     """
     result = list(shares)
     if name:
         needle = str(name).lower()
         result = [s for s in result
                   if needle in str(_field(s, "name", "id", default="")).lower()]
+    if share_id:
+        needle = str(share_id).lower()
+        result = [s for s in result
+                  if needle in str(_field(s, "id", "name", default="")).lower()]
     if status:
         needle = str(status).lower()
         result = [s for s in result
                   if str(_field(s, "status", default="")).lower() == needle]
+    if share_proto:
+        needle = str(share_proto).lower()
+        result = [s for s in result
+                  if str(_field(s, "share_proto", "share_type",
+                                default="")).lower() == needle]
+    if az:
+        needle = str(az).lower()
+        result = [s for s in result
+                  if needle in str(_get(s, "availability_zone", "az_name",
+                                        "az", default="")).lower()]
     return result
+
+
+def active_filter_descriptions(name=None, share_id=None, status=None,
+                               share_proto=None, az=None):
+    """Human-readable description of the filters actually applied."""
+    filters = []
+    if name:
+        filters.append("name=%s" % name)
+    if share_id:
+        filters.append("id=%s" % share_id)
+    if status:
+        filters.append("status=%s" % status)
+    if share_proto:
+        filters.append("share_proto=%s" % share_proto)
+    if az:
+        filters.append("az=%s" % az)
+    return filters
 
 
 def share_names(shares):
@@ -614,20 +652,32 @@ def _md_cell(value):
     return text or "-"
 
 
-def render_markdown(shares, region, generated_at=None):
+def render_markdown(shares, region, generated_at=None, filters=None,
+                    total_before_filter=None):
     """Render the file-system list as a Markdown document (title + table).
 
+    ``filters`` carries the active client-side filters as human-readable
+    ``key=value`` strings; they are echoed in the metadata line and in the
+    "no match" note. ``total_before_filter`` (when given) lets an empty result
+    distinguish a region that really has no file systems from a filter that
+    matched nothing.
+
     An empty file-system list still produces a valid document: the table header
-    + separator followed by an explicit "no file systems" note (never an
-    error).
+    + separator followed by an explicit note (never an error).
     """
+    filters = list(filters or [])
     rows_data = [normalize_share(share) for share in shares]
     header = "| " + " | ".join(label for label, _ in MD_COLUMNS) + " |"
     separator = "| " + " | ".join("---" for _ in MD_COLUMNS) + " |"
+    if filters:
+        filter_text = "过滤条件: %s" % ", ".join(filters)
+    else:
+        filter_text = "无过滤条件"
     lines = [
         "# Huawei Cloud SFS File Systems — %s" % region,
         "",
-        "> Region: %s | File systems: %d" % (region, len(rows_data)),
+        "> Region: %s | File systems: %d | %s"
+        % (region, len(rows_data), filter_text),
     ]
     if generated_at:
         lines.append("> Generated at: %s" % generated_at)
@@ -638,7 +688,11 @@ def render_markdown(shares, region, generated_at=None):
             cells.append(_md_cell(_field(share, *keys)))
         lines.append("| " + " | ".join(cells) + " |")
     if not rows_data:
-        lines += ["", "_当前区域（%s）无 SFS 文件系统。_" % region]
+        if filters and (total_before_filter is None or total_before_filter > 0):
+            lines += ["", "_当前过滤条件下无匹配的 SFS 文件系统（过滤条件：%s）。_"
+                      % ", ".join(filters)]
+        else:
+            lines += ["", "_当前区域（%s）无 SFS 文件系统。_" % region]
     lines.append("")
     return "\n".join(lines)
 
@@ -681,9 +735,15 @@ def main(argv=None):
                              % DEFAULT_OUTPUT)
     parser.add_argument("--name",
                         help="按文件系统名称过滤（客户端子串匹配，大小写不敏感）")
+    parser.add_argument("--id", dest="share_id",
+                        help="按文件系统 ID 过滤（客户端子串匹配，大小写不敏感）")
     parser.add_argument("--status",
                         help="按状态过滤（客户端精确匹配，如 available/creating；"
                              "SFS ListShares API 无此参数，全量取回后本地过滤）")
+    parser.add_argument("--share-proto", dest="share_proto",
+                        help="按协议过滤（客户端精确匹配：NFS / CIFS）")
+    parser.add_argument("--az", dest="az",
+                        help="按可用区过滤（客户端子串匹配，如 cn-north-4a）")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
                         dest="page_size",
                         help="分页大小（默认 %d，最大 %d；超出将被钳制到 [%d, %d]）"
@@ -701,17 +761,20 @@ def main(argv=None):
         raw_argv = argv if argv is not None else sys.argv[1:]
         guard_write_intent(scrub_read_only_values(raw_argv))
         guard_operation(args.operation)
-        shares = list_shares(
-            args.region,
-            status=args.status,
-            name=args.name,
-            limit=args.page_size,
-        )
+        raw_shares = list_shares(args.region, limit=args.page_size)
+        filters = active_filter_descriptions(
+            name=args.name, share_id=args.share_id, status=args.status,
+            share_proto=args.share_proto, az=args.az)
+        shares = filter_shares(
+            raw_shares, name=args.name, share_id=args.share_id,
+            status=args.status, share_proto=args.share_proto, az=args.az)
         output_path = args.output or os.path.join(os.getcwd(), DEFAULT_OUTPUT)
         import datetime
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
-        content = render_markdown(shares, args.region, generated_at)
+        content = render_markdown(shares, args.region, generated_at,
+                                  filters=filters,
+                                  total_before_filter=len(raw_shares))
         write_markdown(content, output_path)
     except SfsExportError as exc:
         print("[错误] %s" % exc, file=sys.stderr)
@@ -720,18 +783,21 @@ def main(argv=None):
     if args.stdout:
         print(content)
     if shares:
-        print("已生成 Markdown 文件：%s（Region %s，共 %d 个 SFS 文件系统）。"
-              % (os.path.abspath(output_path), args.region, len(shares)))
+        print("已生成 Markdown 文件：%s（Region %s，共 %d 个 SFS 文件系统，%s）。"
+              % (os.path.abspath(output_path), args.region, len(shares),
+                 "过滤条件: %s" % ", ".join(filters) if filters
+                 else "无过滤条件"))
+    elif filters and raw_shares:
+        print("已生成 Markdown 文件：%s（Region %s 当前过滤条件下无匹配的 SFS "
+              "文件系统，过滤条件: %s；已输出表头与空表提示）。"
+              % (os.path.abspath(output_path), args.region,
+                 ", ".join(filters)))
     else:
-        filters = []
-        if args.status:
-            filters.append("status=%s" % args.status)
-        if args.name:
-            filters.append("name=%s" % args.name)
-        suffix = "过滤条件: %s" % ", ".join(filters) if filters else "无过滤条件"
         print("已生成 Markdown 文件：%s（Region %s 无 SFS 文件系统，%s；"
               "已输出表头与空表提示）。"
-              % (os.path.abspath(output_path), args.region, suffix))
+              % (os.path.abspath(output_path), args.region,
+                 "过滤条件: %s" % ", ".join(filters) if filters
+                 else "无过滤条件"))
     return 0
 
 
