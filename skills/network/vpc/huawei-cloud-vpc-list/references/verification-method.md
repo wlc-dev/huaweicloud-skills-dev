@@ -28,6 +28,8 @@ python3 scripts/list_vpc.py --region cn-north-4                  # full flow
 python3 scripts/list_vpc.py --json | python3 -m json.tool >/dev/null  # JSON validity
 python3 scripts/list_vpc.py --names-only
 python3 scripts/list_vpc.py --id <vpc-id>                        # server-side filter
+# equivalent direct KooCLI form (v3 array parameter):
+#   hcloud VPC ListVpcs --cli-region=cn-north-4 --id.1=<vpc-id> --limit=10
 python3 scripts/list_vpc.py --enterprise-project-id 0
 ```
 
@@ -63,3 +65,14 @@ KooCLI path cannot be executed live; its command/parameter shape is derived from
 the official SDK request model and the KooCLI
 `hcloud <Service> <Operation> --cli-region=<region>` format standard. The SDK
 fallback path is import-verified against the installed `huaweicloudsdkvpc`.
+## Markdown contract cross-reference
+
+The `--format md` output of this skill deliberately follows the same contract as
+the sibling `huawei-cloud-vpc-export-markdown` skill (fixed 8-column table, VPC
+名称 first, `-` for missing fields, header-only table for an empty list, default
+`vpc_list_<region>_<timestamp>.md`, parent directory auto-creation, temp file +
+atomic rename). The rendering code is **copied** rather than imported so each
+skill remains independently installable; `tests/test_list_vpc.py`
+(`test_contract_matches_export_markdown`) imports the export skill's renderer
+under test and asserts the headers, rows, empty table and summary line are
+byte-identical. The export skill itself is not modified by this change.

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,21 +10,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from list_vpc import (  # noqa: E402
     ALLOWED_OPERATION,
+    MD_HEADERS,
     ApiError,
     AuthError,
     ConfigError,
+    ExportError,
     GuardError,
     VpcListError,
     build_command,
     classify_hcloud_failure,
+    default_output_path,
+    export_markdown,
     extract_json,
     extract_vpcs,
     guard_operation,
+    guard_text_from_argv,
     guard_write_intent,
     list_vpcs,
     list_vpcs_via_sdk,
     main,
     normalize_vpc,
+    normalized_row,
+    render_markdown,
     render_table,
     vpc_names,
 )
@@ -113,6 +121,28 @@ class TestWriteIntentGuard(unittest.TestCase):
             guard_operation("ShowVpc")
         self.assertTrue(guard_operation(ALLOWED_OPERATION))
 
+    def test_guard_text_strips_output_value(self):
+        text = guard_text_from_argv(
+            ["--format", "md", "--output", "/tmp/vpc-delete-report.md"])
+        self.assertNotIn("delete", text)
+        self.assertFalse(guard_write_intent(text))
+
+    def test_guard_text_strips_equals_form(self):
+        text = guard_text_from_argv(["--output=/tmp/vpc-delete.md", "-f=md"])
+        self.assertNotIn("delete", text)
+        self.assertFalse(guard_write_intent(text))
+
+    def test_guard_text_keeps_filter_values_scanned(self):
+        text = guard_text_from_argv(["--id", "release-me"])
+        with self.assertRaises(GuardError):
+            guard_write_intent(text)
+
+    def test_guard_text_still_scans_following_flag(self):
+        text = guard_text_from_argv(
+            ["--output", "/tmp/report.md", "--operation", "DeleteVpc"])
+        with self.assertRaises(GuardError):
+            guard_write_intent(text)
+
 
 class TestBuildCommand(unittest.TestCase):
     def test_basic(self):
@@ -131,9 +161,17 @@ class TestBuildCommand(unittest.TestCase):
     def test_filters_forwarded_server_side(self):
         argv = build_command("cn-south-1", vpc_id="vpc-9",
                              enterprise_project_id="0", limit=10)
-        self.assertIn("--id=vpc-9", argv)
+        self.assertIn("--id.1=vpc-9", argv)
         self.assertIn("--enterprise_project_id=0", argv)
         self.assertIn("--limit=10", argv)
+
+    def test_id_uses_indexed_array_form(self):
+        # VPC ListVpcs v3 declares id as array<string>; KooCLI rejects a bare
+        # --id with "[USE_ERROR]Invalid parameter: id".
+        argv = build_command("cn-north-4", vpc_id="vpc-0001")
+        self.assertIn("--id.1=vpc-0001", argv)
+        self.assertNotIn("--id=vpc-0001", argv)
+        self.assertFalse(any(a == "--id" or a.startswith("--id=") for a in argv))
 
     def test_no_write_flags_ever_added(self):
         argv = build_command("cn-north-4", enterprise_project_id="0")
@@ -233,7 +271,7 @@ class TestListVpcs(unittest.TestCase):
         with mock.patch("list_vpc.subprocess.run", fake):
             list_vpcs("cn-north-4", vpc_id="vpc-0001", enterprise_project_id="0")
         call = fake.calls[0]
-        self.assertTrue(any("--id=vpc-0001" in part for part in call))
+        self.assertTrue(any("--id.1=vpc-0001" in part for part in call))
         self.assertTrue(any("--enterprise_project_id=0" in part for part in call))
 
     def test_use_error_rc0_raises_api_error(self):
@@ -546,7 +584,7 @@ class TestMain(unittest.TestCase):
                 mock.patch("sys.stderr"):
             rc = main(["--id", "vpc-0001"])
         self.assertEqual(rc, 0)
-        self.assertTrue(any("--id=vpc-0001" in part for part in fake.calls[0]))
+        self.assertTrue(any("--id.1=vpc-0001" in part for part in fake.calls[0]))
 
     def test_empty_json_output(self):
         rc, out, err = self._run(
@@ -607,9 +645,258 @@ class TestMain(unittest.TestCase):
         self.assertIn("守卫拦截", err)
 
 
+class TestMarkdownRender(unittest.TestCase):
+    def test_headers_fixed_name_first(self):
+        text = render_markdown([VPC_1], region="cn-north-4")
+        self.assertEqual(
+            text.splitlines()[0],
+            "| VPC 名称 | VPC ID | 区域 | 网段 | 状态 | 企业项目 ID | 描述 | 创建时间 |")
+        self.assertEqual(len(MD_HEADERS), 8)
+        self.assertEqual(MD_HEADERS[0], "VPC 名称")
+
+    def test_separator_row(self):
+        lines = render_markdown([VPC_1], region="cn-north-4").splitlines()
+        self.assertEqual(lines[1], "| " + " | ".join(["---"] * 8) + " |")
+
+    def test_row_has_eight_columns(self):
+        row = normalized_row(VPC_1, region="cn-north-4")
+        self.assertEqual(len(row), 8)
+        self.assertEqual(row[0], "vpc-demo-01")
+        self.assertEqual(row[1], "vpc-0001")
+        self.assertEqual(row[2], "cn-north-4")
+        self.assertEqual(row[3], "192.168.0.0/16")
+        self.assertEqual(row[4], "OK")
+        self.assertEqual(row[5], "0")
+        self.assertEqual(row[6], "demo vpc")
+        self.assertEqual(row[7], "2024-01-01T00:00:00")
+
+    def test_missing_fields_render_dash(self):
+        row = normalized_row(VPC_2, region="cn-north-4")
+        self.assertEqual(row[6], "-")
+        self.assertEqual(row[7], "-")
+        self.assertIn("| vpc-demo-02 | vpc-0002 | cn-north-4 | 10.0.0.0/8 | CREATING | 0 | - | - |",
+                      render_markdown([VPC_2], region="cn-north-4"))
+
+    def test_empty_list_renders_header_only_table(self):
+        lines = render_markdown([], region="cn-north-4").splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("| VPC 名称 |"))
+
+    def test_summary_line(self):
+        text = render_markdown([VPC_1, VPC_2], summary=True, region="cn-north-4")
+        self.assertIn("**汇总**：共 2 个 VPC（Region cn-north-4）。", text)
+
+    def test_pipe_in_value_escaped(self):
+        vpc = {"id": "vpc-9", "name": "a|b"}
+        self.assertIn("a\\|b", render_markdown([vpc], region="cn-north-4"))
+
+    def test_contract_matches_export_markdown(self):
+        try:
+            sys.path.insert(0, os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "..", "huawei-cloud-vpc-export-markdown", "scripts"))
+            import export_vpc_markdown as ref
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(MD_HEADERS, ref.MD_HEADERS)
+        self.assertEqual(normalized_row(VPC_1, region="cn-north-4"),
+                         ref.normalized_row(VPC_1, region="cn-north-4"))
+        self.assertEqual(render_markdown([], region="cn-north-4"),
+                         ref.render_markdown([], region="cn-north-4"))
+        self.assertEqual(render_markdown([VPC_1, VPC_2], summary=True, region="cn-north-4"),
+                         ref.render_markdown([VPC_1, VPC_2], summary=True,
+                                             region="cn-north-4"))
+
+
+class TestMarkdownExport(unittest.TestCase):
+    def test_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.md")
+            written = export_markdown([VPC_1], path, region="cn-north-4")
+            self.assertEqual(written, os.path.abspath(path))
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("VPC 名称", text)
+            self.assertIn("vpc-demo-01", text)
+            self.assertEqual(text.count("\n"), 3)
+
+    def test_empty_list_writes_header_only_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.md")
+            export_markdown([], path, region="cn-north-4")
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(lines[0].startswith("| VPC 名称 |"))
+
+    def test_creates_missing_parent_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "deep", "out.md")
+            export_markdown([VPC_1], path)
+            self.assertTrue(os.path.isfile(path))
+
+    def test_summary_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.md")
+            export_markdown([VPC_1], path, summary=True, region="cn-south-1")
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("**汇总**：共 1 个 VPC（Region cn-south-1）。", text)
+
+    def test_bad_path_raises_and_leaves_no_partial_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not-a-dir")
+            with open(blocker, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            path = os.path.join(blocker, "out.md")
+            with self.assertRaises(ExportError):
+                export_markdown([VPC_1], path)
+            self.assertFalse(os.path.exists(path))
+            self.assertEqual(sorted(os.listdir(tmp)), ["not-a-dir"])
+
+    def test_no_temp_file_left_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.md")
+            export_markdown([VPC_1], path)
+            self.assertEqual(sorted(os.listdir(tmp)), ["out.md"])
+
+    def test_default_output_path_format(self):
+        import re as _re
+        name = default_output_path("cn-north-4")
+        self.assertRegex(
+            name, _re.compile(r"^vpc_list_cn-north-4_\d{8}_\d{6}\.md$"))
+
+
+class TestMainMarkdown(unittest.TestCase):
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_vpc.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    def test_md_output_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sub", "report.md")
+            rc, out, err = self._run(
+                ["--format", "md", "--output", path],
+                [(json.dumps({"vpcs": [VPC_1, VPC_2]}), "", 0)])
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(path))
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertTrue(text.splitlines()[0].startswith("| VPC 名称 |"))
+            self.assertIn("vpc-demo-01", text)
+            self.assertIn("已生成", out)
+
+    def test_md_short_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.md")
+            rc, _, err = self._run(
+                ["-f", "md", "-o", path],
+                [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(path))
+
+    def test_empty_md_writes_empty_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.md")
+            rc, out, err = self._run(
+                ["--format", "md", "--output", path],
+                [(json.dumps({"vpcs": []}), "", 0)])
+            self.assertEqual(rc, 0, err)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(len(handle.read().splitlines()), 2)
+            self.assertIn("仅表头", out)
+            self.assertIn("无虚拟私有云（VPC）", out)
+
+    def test_empty_filtered_md_mentions_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "empty.md")
+            rc, out, _ = self._run(
+                ["--format", "md", "--output", path,
+                 "--enterprise-project-id", "0"],
+                [(json.dumps({"vpcs": []}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertIn("enterprise_project_id=0", out)
+
+    def test_default_md_path_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vpc_list_cn-north-4_20240101_000000.md")
+            with mock.patch("list_vpc.default_output_path", return_value=path):
+                rc, _, err = self._run(
+                    ["--format", "md"],
+                    [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(path))
+
+    def test_summary_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.md")
+            rc, _, _ = self._run(
+                ["--format", "md", "--output", path, "--summary"],
+                [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                self.assertIn("**汇总**", handle.read())
+
+    def test_output_path_with_delete_not_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vpc-delete-report.md")
+            rc, _, err = self._run(
+                ["--format", "md", "--output", path],
+                [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(path))
+
+    def test_md_auth_error_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.md")
+            rc, _, err = self._run(
+                ["--format", "md", "--output", path], [("", "403 Forbidden", 1)])
+            self.assertEqual(rc, 1)
+            self.assertIn("IAM", err)
+            self.assertFalse(os.path.exists(path))
+
+    def test_format_json_mode(self):
+        rc, out, _ = self._run(
+            ["--format", "json"],
+            [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [VPC_1])
+
+    def test_format_names_mode(self):
+        rc, out, _ = self._run(
+            ["--format", "names"],
+            [(json.dumps({"vpcs": [VPC_1, VPC_2]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("vpc-demo-01", out)
+        self.assertNotIn("cidr", out)
+
+    def test_format_table_mode(self):
+        rc, out, _ = self._run(
+            ["--format", "table"],
+            [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("完整字段", out)
+
+    def test_legacy_json_wins_over_md(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.md")
+            rc, out, _ = self._run(
+                ["--json", "--format", "md", "--output", path],
+                [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out), [VPC_1])
+            self.assertFalse(os.path.exists(path))
+
+
 class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
-        for exc in (GuardError, ConfigError, AuthError, ApiError):
+        for exc in (GuardError, ConfigError, AuthError, ApiError, ExportError):
             self.assertTrue(issubclass(exc, VpcListError))
 
 

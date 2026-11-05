@@ -4,14 +4,18 @@
 Primary execution path is KooCLI (`hcloud VPC ListVpcs`, read-only
 GET /v1/{project_id}/vpcs); when hcloud is not installed the script falls back
 to the official `huaweicloudsdkvpc` v2 SDK (`VpcClient.list_vpcs`). Reads nothing
-but the active credential profile / environment. Supports three output modes
-(table / --json / --names-only), --id / --enterprise-project-id filters (real
-server-side query parameters), marker-based paging, and a strict write-intent
-guard: any argument that looks like a mutating VPC operation is rejected before
-a single command is executed.
+but the active credential profile / environment. Supports full-field table
+(default), --json, --names-only and --format md (local Markdown report; optional
+--output / --summary), --id / --enterprise-project-id filters (real server-side
+query parameters; ListVpcs `--id` is an array query parameter, emitted as
+`--id.1=<vpc-id>`), marker-based paging, and a strict write-intent guard: any
+argument that looks like a mutating VPC operation is rejected before a single
+command is executed.
 
 Usage:
     python3 scripts/list_vpc.py [--region cn-north-4] [--json | --names-only]
+                                [--format table|json|names|md]
+                                [--output <path.md>] [--summary]
                                 [--id <vpc-id>] [--enterprise-project-id <id>]
                                 [--page-size 100] [--project-id <id>]
                                 [--operation ListVpcs]
@@ -25,14 +29,39 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime
+
+# Keep the shipped skill directory clean: never emit __pycache__/*.pyc.
+sys.dont_write_bytecode = True
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
+DEFAULT_FORMAT = "table"
 SERVICE = "VPC"
 ALLOWED_OPERATION = "ListVpcs"
 REST_PATH = "/v1/{project_id}/vpcs"
+
+# Markdown report column order (the first column is the required VPC name) —
+# kept identical to huawei-cloud-vpc-export-markdown (8 fixed columns).
+MD_HEADERS = [
+    "VPC 名称", "VPC ID", "区域", "网段", "状态",
+    "企业项目 ID", "描述", "创建时间",
+]
+DEFAULT_FILENAME_PREFIX = "vpc_list"
+_FIELD_MISSING = "-"
+
+# Values of these flags are pure file-path / format data and are excluded from
+# the write-intent scan (e.g. a local path "vpc-delete-report.md").
+_VALUE_STRIPPED_FLAGS = (
+    "--output",
+    "-o",
+    "--format",
+    "-f",
+)
 
 # Mutating VPC operations / intents — strictly rejected by the guard.
 WRITE_INTENT_KEYWORDS = (
@@ -158,6 +187,10 @@ class ApiError(VpcListError):
     """hcloud / network / unexpected API failure."""
 
 
+class ExportError(VpcListError):
+    """The Markdown file could not be produced (bad path / write failure)."""
+
+
 def guard_write_intent(text):
     """Raise GuardError if `text` carries a mutating intent.
 
@@ -186,6 +219,36 @@ def guard_operation(operation):
     return True
 
 
+def guard_text_from_argv(argv):
+    """Build the text the write-intent guard should scan.
+
+    Flag names and positional tokens are scanned, but the values of the local
+    output/format flags (``--output`` / ``-o`` / ``--format`` / ``-f``) are
+    stripped: they are pure file-path / format data and may legitimately
+    contain write-looking words (e.g. a report path ``vpc-delete-report.md``).
+    Filter values (``--id`` etc.) are still scanned, so a mutating value cannot
+    hide behind a filter flag.
+
+    A *flag* following such an option is never swallowed: a following token
+    that starts with ``-`` is still scanned.
+    """
+    tokens = list(argv if argv is not None else sys.argv[1:])
+    kept = []
+    skip_next = False
+    for tok in tokens:
+        if tok in _VALUE_STRIPPED_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-") and "=" in tok and tok.split("=", 1)[0] in _VALUE_STRIPPED_FLAGS:
+            continue
+        if skip_next:
+            skip_next = False
+            if not tok.startswith("-"):
+                continue
+        kept.append(tok)
+    return " ".join(kept)
+
+
 def build_command(region, vpc_id=None, enterprise_project_id=None,
                   limit=DEFAULT_PAGE_SIZE, marker=None):
     """Build the hcloud VPC ListVpcs argv (without the executable).
@@ -194,6 +257,10 @@ def build_command(region, vpc_id=None, enterprise_project_id=None,
     operation: --cli-region / --limit / --marker and the real server-side
     filters --id / --enterprise_project_id. VPC pages with `limit` + `marker`
     (the next_marker comes from the response page_info).
+
+    ListVpcs is a v3 API where `id` is declared as ``array<string>``, so KooCLI
+    only accepts the indexed form ``--id.1=<vpc-id>``; a bare ``--id=<vpc-id>``
+    is rejected with ``[USE_ERROR]Invalid parameter: id``.
     """
     argv = [
         SERVICE,
@@ -204,7 +271,7 @@ def build_command(region, vpc_id=None, enterprise_project_id=None,
     if marker:
         argv.append("--marker=%s" % marker)
     if vpc_id:
-        argv.append("--id=%s" % vpc_id)
+        argv.append("--id.1=%s" % vpc_id)
     if enterprise_project_id:
         argv.append("--enterprise_project_id=%s" % enterprise_project_id)
     return argv
@@ -527,13 +594,102 @@ def render_table(vpcs):
     if not columns:
         columns = ["id", "name"]
     rows = [[_cell(_field(c, col)) for col in columns] for c in rows_data]
-    widths = [max(len(col), *(len(row[i]) for row in rows)) for i, col in enumerate(columns)]
+    if rows:
+        widths = [max(len(col), *(len(row[i]) for row in rows))
+                  for i, col in enumerate(columns)]
+    else:
+        widths = [len(col) for col in columns]
     header = "  ".join(col.ljust(widths[i]) for i, col in enumerate(columns))
     separator = "  ".join("-" * w for w in widths)
     lines = [header, separator]
     for row in rows:
         lines.append("  ".join(row[i].ljust(widths[i]) for i in range(len(columns))))
     return "\n".join(lines)
+
+
+def _md_escape(value):
+    """Escape pipe/newline characters so a cell cannot break the Markdown table."""
+    return _cell(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def normalized_row(vpc, region=None):
+    """Map a VPC record to the fixed Markdown column order (8 columns)."""
+    return [
+        _md_escape(_field(vpc, "name")),
+        _md_escape(_field(vpc, "id")),
+        _md_escape(region if region else _FIELD_MISSING),
+        _md_escape(_field(vpc, "cidr")),
+        _md_escape(_field(vpc, "status")),
+        _md_escape(_field(vpc, "enterprise_project_id")),
+        _md_escape(_field(vpc, "description")),
+        _md_escape(_field(vpc, "created_at")),
+    ]
+
+
+def render_markdown(vpcs, summary=False, region=None):
+    """Render the VPC list as a GitHub-flavored Markdown table.
+
+    An empty list still renders a valid (header-only) table, so "no VPC" never
+    produces a corrupt file — it produces an explicit empty table. The contract
+    is identical to huawei-cloud-vpc-export-markdown.
+    """
+    lines = [
+        "| " + " | ".join(MD_HEADERS) + " |",
+        "| " + " | ".join(["---"] * len(MD_HEADERS)) + " |",
+    ]
+    for vpc in vpcs:
+        lines.append("| " + " | ".join(normalized_row(vpc, region=region)) + " |")
+    if summary:
+        lines.append("")
+        lines.append("**汇总**：共 %d 个 VPC（Region %s）。"
+                     % (len(vpcs), region or _FIELD_MISSING))
+    return "\n".join(lines)
+
+
+def default_output_path(region):
+    """Default .md filename: vpc_list_<region>_<timestamp>.md"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return "%s_%s_%s.md" % (DEFAULT_FILENAME_PREFIX, region, stamp)
+
+
+def export_markdown(vpcs, output_path, summary=False, region=None):
+    """Write the VPC list as a Markdown report at ``output_path``.
+
+    The parent directory is created automatically and the file is written via a
+    temporary file + atomic rename, so an interrupted write never leaves a
+    corrupt/partial ``.md``. Returns the absolute path of the written file.
+    """
+    vpcs = list(vpcs)
+    output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.isdir(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            raise ExportError(
+                "无法创建输出目录 %r：%s。请检查 --output 路径。"
+                % (output_dir, exc)
+            )
+
+    text = render_markdown(vpcs, summary=summary, region=region)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".%s." % DEFAULT_FILENAME_PREFIX, suffix=".tmp",
+        dir=output_dir or ".")
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        shutil.move(tmp_path, output_path)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise ExportError("Markdown 文件写出失败：%s（%s）"
+                          % (output_path, exc))
+    return output_path
 
 
 def main(argv=None):
@@ -545,6 +701,14 @@ def main(argv=None):
                         help="以 JSON 输出完整原始字段")
     parser.add_argument("--names-only", action="store_true", dest="names_only",
                         help="仅输出 VPC 名称清单")
+    parser.add_argument("-f", "--format", default=DEFAULT_FORMAT,
+                        choices=["table", "json", "names", "md"],
+                        help="输出格式：table（默认）/ json / names / md")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Markdown 输出路径（仅 --format md；默认 "
+                             "vpc_list_<region>_<timestamp>.md）")
+    parser.add_argument("--summary", action="store_true",
+                        help="Markdown 报表末尾追加汇总行（VPC 数量）")
     parser.add_argument("--id", dest="vpc_id",
                         help="按 VPC ID 过滤（服务端查询参数）")
     parser.add_argument("--enterprise-project-id", dest="enterprise_project_id",
@@ -555,11 +719,22 @@ def main(argv=None):
                         help="项目 ID（可选；SDK 回退在 /v1/{project_id}/vpcs 路径中需要）")
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
                         help="hcloud VPC 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+    raw_argv = argv if argv is not None else sys.argv[1:]
+
+    # Write-intent guard runs on the RAW argv BEFORE argparse, so that a
+    # mutating flag (e.g. `--operation DeleteVpc`) is reported as a guard
+    # violation instead of an argparse "unrecognized argument" error. The
+    # values of --output / --format are pure local path / format data and are
+    # excluded (a path like vpc-delete-report.md must not trip the guard).
+    try:
+        guard_write_intent(guard_text_from_argv(raw_argv))
+    except VpcListError as exc:
+        print("[错误] %s" % exc, file=sys.stderr)
+        return 1
+
     args = parser.parse_args(argv)
 
     try:
-        # Write-intent guard: scan the raw argv + validate the operation name.
-        guard_write_intent(" ".join(argv if argv is not None else sys.argv[1:]))
         guard_operation(args.operation)
         if args.vpc_id:
             guard_write_intent(args.vpc_id)
@@ -574,24 +749,42 @@ def main(argv=None):
         print("[错误] %s" % exc, file=sys.stderr)
         return 1
 
-    if args.as_json:
-        print(json.dumps(vpcs, ensure_ascii=False, indent=2))
-        return 0
+    filters = []
+    if args.vpc_id:
+        filters.append("id=%s" % args.vpc_id)
+    if args.enterprise_project_id:
+        filters.append("enterprise_project_id=%s" % args.enterprise_project_id)
+    filter_suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
 
-    if args.names_only:
+    # Legacy flags keep their precedence: --names-only -> --json -> --format.
+    if args.names_only or args.format == "names":
         print("Region %s 的虚拟私有云（VPC）名称列表（共 %d 个）：" % (args.region, len(vpcs)))
         for name in vpc_names(vpcs):
             print("- %s" % name)
         return 0
 
+    if args.as_json or args.format == "json":
+        print(json.dumps(vpcs, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.format == "md":
+        output_path = args.output or default_output_path(args.region)
+        try:
+            written = export_markdown(vpcs, output_path,
+                                      summary=args.summary, region=args.region)
+        except ExportError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        if not vpcs:
+            print("当前区域（%s）无虚拟私有云（VPC）%s，已生成空表（仅表头）：%s"
+                  % (args.region, filter_suffix, written))
+            return 0
+        print("已生成 VPC 列表 Markdown 报表（Region %s，共 %d 个 VPC，"
+              "含 VPC 名称列）：%s" % (args.region, len(vpcs), written))
+        return 0
+
     if not vpcs:
-        filters = []
-        if args.vpc_id:
-            filters.append("id=%s" % args.vpc_id)
-        if args.enterprise_project_id:
-            filters.append("enterprise_project_id=%s" % args.enterprise_project_id)
-        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
-        print("当前区域（%s）无虚拟私有云（VPC）%s。" % (args.region, suffix))
+        print("当前区域（%s）无虚拟私有云（VPC）%s。" % (args.region, filter_suffix))
         return 0
 
     print("Region %s 的虚拟私有云（VPC）列表（共 %d 个，完整字段）：" % (args.region, len(vpcs)))

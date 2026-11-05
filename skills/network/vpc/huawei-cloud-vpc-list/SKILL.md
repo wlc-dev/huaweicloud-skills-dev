@@ -5,24 +5,38 @@ description: |
      region through KooCLI (hcloud VPC ListVpcs — read-only GET
      /v1/{project_id}/vpcs), with an automatic fallback to the official
      huaweicloudsdkvpc v2 SDK when hcloud is not installed.
-  2. Three output modes: full-field table (default, every returned field
+  2. Four output modes: full-field table (default, every returned field
      including id/name/cidr/status and the remaining VPC attributes), --json
-     (raw response array), and --names-only (compact VPC name list).
-  3. Supports --id / --enterprise-project-id filtering (both real server-side
-     ListVpcs query parameters), region override, and automatic marker paging.
-  4. Explicit error hints for empty VPC lists (「当前区域无虚拟私有云（VPC）」),
+     (raw response array), --names-only (compact VPC name list), and
+     --format md (local Markdown report whose first column is VPC 名称).
+  3. `--format md` writes a fixed 8-column Markdown table (VPC 名称 / VPC ID /
+     区域 / 网段 / 状态 / 企业项目 ID / 描述 / 创建时间; missing field `-`;
+     empty list = header-only table) to `--output`/`-o` (default
+     `vpc_list_<region>_<timestamp>.md`), creates the parent directory, and
+     writes via a temp file + atomic rename. Optional `--summary` appends the
+     VPC count. Contract matches the dedicated VPC Markdown export skill
+     (same fixed 8-column table; rendering kept independently).
+  4. Supports --id / --enterprise-project-id filtering (both real server-side
+     ListVpcs query parameters; the CLI path emits the v3 array form
+     `--id.1=<vpc-id>`, which KooCLI requires), region override, and automatic
+     marker paging.
+  5. Explicit error hints for empty VPC lists (「当前区域无虚拟私有云（VPC）」),
      403 / insufficient IAM permission (「无权限访问虚拟私有云（VPC）」),
      missing or invalid AK/SK credentials, missing project_id on the SDK
      fallback, and hcloud not installed.
-  5. Built-in write-intent guard: any mutating intent (create / delete / update /
+  6. Built-in write-intent guard: any mutating intent (create / delete / update /
      associate / disassociate / attach / detach / release / change) or any
      operation other than ListVpcs is rejected before execution — this skill is
-     strictly read-only.
-  6. Triggers include: "list VPCs", "vpc list", "虚拟私有云列表", "查询 VPC",
+     strictly read-only. The local `--output` / `--format` values are excluded
+     from the guard (a report path like `vpc-delete-report.md` is not a VPC
+     operation).
+  7. Triggers include: "list VPCs", "vpc list", "虚拟私有云列表", "查询 VPC",
      "查询虚拟私有云", "VPC 名称列表", "VPC 实例列表", "vpc inventory",
-     "list vpcs", "华为云 VPC", "私有云列表".
-  7. Offline unit tests (mocked hcloud subprocess) cover output modes, filters,
-     marker paging, error scenarios, SDK fallback, and the write-intent guard.
+     "list vpcs", "华为云 VPC", "私有云列表". Dedicated Markdown-report intents
+     are routed to the sibling export skill (see the division of labour below).
+  8. Offline unit tests (mocked hcloud subprocess) cover output modes, Markdown
+     rendering/export, filters, marker paging, error scenarios, SDK fallback,
+     and the write-intent guard.
 tags: [huawei-cloud, vpc, network, readonly, koo-cli]
 ---
 
@@ -41,7 +55,8 @@ Architecture:
 
 ```text
 agent → python3 scripts/list_vpc.py → hcloud VPC ListVpcs --cli-region=<region>
-      → Huawei Cloud VPC OpenAPI (vpc.<region>.myhuaweicloud.com) → parsed JSON → table / --json / --names-only
+      → Huawei Cloud VPC OpenAPI (vpc.<region>.myhuaweicloud.com) → parsed JSON
+      → table / --json / --names-only / --format md (.md file on local disk)
 
 (hcloud binary missing) → fallback: huaweicloudsdkvpc v2 VpcClient.list_vpcs
 ```
@@ -60,14 +75,29 @@ Key properties:
 - **Full-field table output** — the default table renders the union of all
   fields returned by ListVpcs, with the nested `routes` array compacted into a
   single JSON column.
-- **Offline-testable** — every code path (marker paging, filters, error
-  classification, guard, SDK fallback) is covered by unit tests that mock the
-  hcloud subprocess.
+- **Name-first Markdown report** — `--format md` writes a fixed 8-column
+  Markdown table (`VPC 名称` first), with a `-` fallback for missing fields and
+  a header-only table for an empty list. The report is generated on the local
+  filesystem only, via a temp file + atomic rename; nothing is written back to
+  the cloud.
+- **Offline-testable** — every code path (marker paging, filters, output modes,
+  Markdown rendering/export, error classification, guard, SDK fallback) is
+  covered by unit tests that mock the hcloud subprocess.
 
 Out of scope: every mutating VPC action (create / update / delete a VPC, subnet,
 security group, route table, port or flow log; associate / disassociate a
 resource; VPC peering accept/reject). Those require a dedicated write-capable
 skill and explicit user confirmation.
+
+**Division of labour with the dedicated VPC Markdown export skill**: this skill
+is the general VPC list / query entry point, and now also offers a convenience
+`--format md` export. The dedicated VPC Markdown export skill remains the
+Markdown-export specialist (same 8-column contract, rendering logic kept
+independently, each skill installs on its own; see
+`references/verification-method.md` for the cross-reference note). For
+"导出 VPC 名称清单为 Markdown / VPC Markdown 报表" intents either skill works;
+prefer the export skill when the task is purely Markdown deliverable, and this
+skill when the task also needs table/json/name-list querying.
 
 **Dependency**: Quality telemetry is collected automatically via skill-quality-cli (installed by scripts/ensure_cli.sh if absent).
 
@@ -102,9 +132,11 @@ skill and explicit user confirmation.
    credential profile.
 3. **Run the list script** with the desired output mode and filters.
 4. **Read the result** — table for humans, `--json` for downstream tooling,
-   `--names-only` for a compact inventory.
+   `--names-only` for a compact inventory, `--format md` for a local Markdown
+   report (the printed path is the generated `.md`).
 5. **Handle the empty / error cases** per the Edge Cases table below (the
-   script prints an explicit hint for empty region, 403, and missing AK/SK).
+   script prints an explicit hint for empty region, 403, and missing AK/SK;
+   `--format md` always leaves a valid header-only file for an empty list).
 
 ## Core Commands
 
@@ -120,12 +152,27 @@ python3 scripts/list_vpc.py --json
 # Compact VPC name list only
 python3 scripts/list_vpc.py --names-only
 
+# Explicit format selection (table / json / names / md)
+python3 scripts/list_vpc.py --format table
+python3 scripts/list_vpc.py --format json
+python3 scripts/list_vpc.py --format names
+
+# Markdown report (default path vpc_list_<region>_<timestamp>.md in cwd)
+python3 scripts/list_vpc.py --format md
+
+# Markdown report to an explicit path (parent dir auto-created)
+python3 scripts/list_vpc.py --format md --output /tmp/vpc_list_cn-north-4.md
+
+# Markdown report with a trailing summary line (VPC count)
+python3 scripts/list_vpc.py --format md --summary
+
 # Filter by exact VPC id / enterprise project id (server-side query parameters)
 python3 scripts/list_vpc.py --id vpc-0001
 python3 scripts/list_vpc.py --enterprise-project-id 0
 
 # Combine filters
 python3 scripts/list_vpc.py --region cn-north-4 --enterprise-project-id 0 --names-only
+python3 scripts/list_vpc.py --format md --output ./vpc.md --enterprise-project-id 0
 ```
 
 Equivalent direct KooCLI command (the script wraps exactly this call, with
@@ -145,22 +192,30 @@ skill-quality-cli run --skill-name huawei-cloud-vpc-list -- hcloud configure lis
 | `--region` / `-r` | No | Huawei Cloud region (default `cn-north-4`) | `cn-south-1` |
 | `--json` | No | Output the raw instance array as JSON | — |
 | `--names-only` | No | Output the VPC name list only | — |
-| `--id` | No | Filter by exact VPC ID — real server-side ListVpcs query parameter | `vpc-0001` |
+| `--format` / `-f` | No | Output mode: `table` (default) / `json` / `names` / `md` | `--format md` |
+| `--output` / `-o` | No | Markdown file path (only used with `--format md`; default `vpc_list_<region>_<timestamp>.md`) | `/tmp/report.md` |
+| `--summary` | No | Append a summary line (VPC 数量) to the Markdown report | `--summary` |
+| `--id` | No | Filter by exact VPC ID — real server-side ListVpcs query parameter (forwarded to KooCLI as the v3 array form `--id.1=<vpc-id>`) | `vpc-0001` |
 | `--enterprise-project-id` | No | Filter by enterprise project ID — real server-side query parameter (`0` = default project) | `0` |
 | `--page-size` | No | Page size for ListVpcs (default 100, range 0–2000) | `100` |
 | `--project-id` | No | Project ID (needed by the SDK fallback path for `/v1/{project_id}/...`) | `05f...` |
 | `--operation` | No | hcloud VPC operation name; only `ListVpcs` is allowed | `ListVpcs` |
 
-Output-mode precedence: `--names-only` → `--json` → table (default).
+Output-mode precedence: `--names-only` → `--json` → `--format` → table (default).
+`--output` / `--summary` only matter for `--format md`; `--format md` writes a
+file and prints its path instead of printing the table.
 
 ## Write-Intent Guard
 
-- The script scans all user arguments plus the `--operation` value for mutating
-  vocabulary (`create`, `delete`, `update`, `modify`, `associate`,
-  `disassociate`, `attach`, `detach`, `bind`, `unbind`, `release`, `change`,
-  `restart`, and VPC operation names such as `CreateVpc`, `DeleteVpc`,
-  `UpdateVpc`, `CreateSubnet`, `DeleteSubnet`, `CreateSecurityGroup`,
-  `CreateVpcPeering`).
+- The script scans all user arguments (except the values of the local
+  output/format flags `--output` / `-o` / `--format` / `-f`, which are pure
+  file-path / format data) plus the `--operation` value for mutating vocabulary
+  (`create`, `delete`, `update`, `modify`, `associate`, `disassociate`,
+  `attach`, `detach`, `bind`, `unbind`, `release`, `change`, `restart`, and VPC
+  operation names such as `CreateVpc`, `DeleteVpc`, `UpdateVpc`,
+  `CreateSubnet`, `DeleteSubnet`, `CreateSecurityGroup`, `CreateVpcPeering`).
+  A following flag is still scanned, so a mutating flag cannot hide behind a
+  stripped value. Filter values (`--id` etc.) remain scanned.
 - Any hit raises `GuardError`, prints `[错误] 检测到写操作意图 ... 已被守卫拦截`, and
   exits with code 1 **before** a single hcloud command is executed.
 - Only the VPC ListVpcs GET call (via KooCLI, or the SDK `list_vpcs` call in the
@@ -178,14 +233,42 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 - **Region parameter** — `--cli-region=<value>`, e.g. `--cli-region=cn-north-4`
   (required for every concrete VPC call).
 - **Simple parameter** — `--key=value`, e.g. `--limit=100`, `--marker=<token>`,
-  `--id=<vpc-id>`, `--enterprise_project_id=0`. Both filters are real
-  server-side ListVpcs parameters (verified against the `huaweicloudsdkvpc` v2
-  `ListVpcsRequest` model).
+  `--enterprise_project_id=0`.
+- **Array parameter** — v3 ListVpcs declares `id` / `cidr` / `description` /
+  `name` as `array<string>`, so the filter must be emitted as
+  `--id.1=<vpc-id>` (a bare `--id=<vpc-id>` fails with
+  `[USE_ERROR]Invalid parameter: id`). Both filters are real server-side
+  ListVpcs parameters (verified against `hcloud VPC ListVpcs --help` and the
+  `huaweicloudsdkvpc` v2 `ListVpcsRequest` model).
 - **Paging** — `--limit` + `--marker`; the marker is the `next_marker` returned
   in the response `page_info` (the marker is a VPC resource id).
 - **REST path (official SDK `_http_info`)** —
   `GET /v1/{project_id}/vpcs` (`huaweicloudsdkvpc` v2 `_list_vpcs_http_info`);
   the project_id is resolved by KooCLI from the credential profile.
+
+## Markdown Format
+
+| Column (header) | Source key | Notes |
+| ---------- | ---------- | --------- |
+| VPC 名称 | `name` | **Required column** — the VPC name |
+| VPC ID | `id` | VPC ID |
+| 区域 | `--region` | Region label of the query |
+| 网段 | `cidr` | VPC CIDR range |
+| 状态 | `status` | `OK` / `CREATING` / ... |
+| 企业项目 ID | `enterprise_project_id` | Enterprise project id (`0` = default) |
+| 描述 | `description` | VPC description |
+| 创建时间 | `created_at` | Creation timestamp |
+
+A missing field renders as `-`; pipe / newline characters are escaped. An
+empty VPC list still renders a valid header-only (empty) table and exits 0.
+`--summary` appends a trailing line:
+`**汇总**：共 <N> 个 VPC（Region <region>）。`
+
+The file is written with a temp file + atomic rename, so an interrupted write
+never leaves a corrupt/partial `.md`. The parent directory of `--output` is
+created automatically. The 8-column contract is held identical to
+the dedicated VPC Markdown export skill (rendering is copied, not imported,
+so the two skills each install independently; a unit test locks the contract).
 
 ## Error Handling
 
@@ -198,6 +281,8 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 | hcloud not installed | Exit 1 after SDK fallback also unavailable, hint to install KooCLI or `pip install huaweicloudsdkvpc` |
 | Network / API failure | Exit 1 with the hcloud stderr excerpt |
 | KooCLI usage error (`[USE_ERROR] ...`, even with exit code 0) | Exit 1, explicit 「hcloud 参数错误」hint pointing to the KooCLI VPC ListVpcs `--help` |
+| Bad `--output` path (permission / bad dir) | Exit 1, `Markdown 文件写出失败` hint; no partial file is left |
+| Empty VPC list with `--format md` | Exit 0, `当前区域（<x>）无虚拟私有云（VPC）...已生成空表（仅表头）`; the `.md` contains a header-only table |
 | Write intent detected | Exit 1, `GuardError` message, no command executed |
 
 Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
@@ -207,13 +292,17 @@ Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
 | Scenario | Handling |
 | ---------- | --------- |
 | Non-`OK` VPCs | Reported with their state (`CREATING`), not treated as failure |
-| `--id` / `--enterprise-project-id` filters | Forwarded as real server-side query parameters (verified API params) |
+| `--id` / `--enterprise-project-id` filters | Forwarded as real server-side query parameters; `--id` uses the v3 array form `--id.1=<vpc-id>` (bare `--id` is rejected by KooCLI) |
 | Large VPC count | Automatic `marker` paging (`next_marker` aware, max 100 pages) |
 | Extra response fields | Table columns are built from the union of returned fields — new fields appear automatically |
 | Field missing on a VPC | Rendered as `-` in the table |
 | Nested `routes` array | Compacted into a single JSON column for the table |
 | Non-JSON hcloud output | `ApiError` with the raw excerpt (first 200 chars) |
 | hcloud absent, SDK installed | Transparent fallback to `huaweicloudsdkvpc` list_vpcs, same output modes |
+| `--format md` and the list is empty (or filtered to empty) | Header-only `.md` written, exit 0; the empty message lists active filters |
+| `--output` points to a non-existing directory | Directory is created automatically |
+| `--output` path contains a guard keyword (e.g. `vpc-delete-report.md`) | Path value is excluded from the guard (local path ≠ VPC operation) |
+| `--format md` combined with legacy `--json` / `--names-only` | Legacy flag wins (`--names-only` → `--json` → `--format`) |
 | User asks to create/delete/associate a VPC | Out of scope — blocked by the write-intent guard; a write-capable skill with explicit user confirmation is required |
 
 ## Testing
@@ -226,14 +315,19 @@ python3 -m unittest discover -s tests -v
 ```
 
 Coverage: write-intent guard (read passes / create / delete / update /
-associate / release / change / normalized variants / operation whitelist),
-command construction (filters forwarded server-side; marker never sent on the
-first page), JSON extraction, failure classification (missing AK/SK, 403,
-generic, `[USE_ERROR]` with rc=0), marker paging (next_marker / full page /
-empty), SDK fallback (success, missing credentials, missing project id, and
-unavailable; request construction matches the real `ListVpcsRequest`
-signature), rendering (table with routes / names / fallbacks), and all main()
-output modes including empty, filter, and error paths.
+associate / release / change / normalized variants / operation whitelist /
+output-value exclusion / following-flag-still-scanned), command construction
+(filters forwarded server-side; marker never sent on the first page), JSON
+extraction, failure classification (missing AK/SK, 403, generic,
+`[USE_ERROR]` with rc=0), marker paging (next_marker / full page / empty), SDK
+fallback (success, missing credentials, missing project id, and unavailable;
+request construction matches the real `ListVpcsRequest` signature), rendering
+(table with routes / names / fallbacks), Markdown rendering (fixed headers /
+name first / `-` fallback / header-only empty table / summary / pipe escaping /
+contract equality with the dedicated export skill), atomic export (file written / empty
+table file / missing dir created / bad path leaves no partial file / default
+name), and all main() output modes including `--format md`, empty, filter, and
+error paths.
 
 ## Reference Documents
 
