@@ -60,11 +60,44 @@ classification (`[USE_ERROR]` treated as a hard failure even at rc=0),
 offset paging (`instance_num`-driven / full-page fallback / empty), SDK
 fallback (env credentials, alternative prefixes, missing credentials,
 missing project id, pagination, filters, real request signature), table /
-JSON / names rendering, and all `main()` output and error paths. The
-SDK-specific tests run when `huaweicloudsdkdcs` is installed and skip
-otherwise.
+JSON / names rendering, Markdown rendering and `--md-output` writing, and all
+`main()` output and error paths. The SDK-specific tests run when
+`huaweicloudsdkdcs` is installed and skip otherwise.
 
-## 5. Functional smoke (optional, read-only)
+## 5. Markdown output verification
+
+The Markdown contract is checked offline (no credentials, no network) by
+`TestMarkdownOutput` / `TestResolveMode` / `TestMarkdownFileHelper`:
+
+| Check | How |
+| ----- | --- |
+| Header is the export-markdown ten columns in order, separator immediately after | exact line equality against the literal `名称/ID/引擎/版本/容量/规格/状态/连接地址/端口/可用区` header and ten `---` cells |
+| Column order / value mapping | `normalized_row` asserted cell by cell (name → id → engine → version → capacity → spec → status → ip → port → az) |
+| Missing fields render `-` | instance with only `instance_id` → nine `-` plus the id |
+| Escaping | name containing a pipe character → backslash-escaped pipe; `RUN\nNING` → `RUN NING`; `x\r\ny` → `x  y` |
+| `--format md` == `--md` | both runs compared as whole stdout strings |
+| Filters / paging still apply | `--md --status RUNNING --page-size 10` → `--status=RUNNING --limit=10` in the hcloud argv |
+| Empty list | hint text only, no table header in stdout, target file absent |
+| `--md-output` content equality | file text asserted equal to captured stdout, `[已写入]` on stderr |
+| Atomic write failure | `os.replace` forced to `OSError` → exit 1, no target file, no leftover `*.tmp` |
+| `--md-output` outside md mode | exit 1 with an explicit hint |
+| Write-intent guard in md mode | `--md --name delete-me` → exit 1; `--md-output .../dcs-backup-restore.md` allowed |
+| Legacy outputs unchanged | default / `--table` / `--json` stdout compared byte-for-byte |
+
+Manual end-to-end check with a stub `hcloud` on `PATH`:
+
+```bash
+DCS_LIST_HCLOUD_BIN=/path/to/stub-hcloud python3 scripts/list_dcs.py --md
+DCS_LIST_HCLOUD_BIN=/path/to/stub-hcloud python3 scripts/list_dcs.py \
+  --md --md-output ./dcs_instances.md
+cat ./dcs_instances.md   # identical to the table printed above
+```
+
+Expected: a ten-column Markdown table (rows for each instance, `-` for fields
+the stub omits); the file content is identical to the printed table; an empty
+stub response prints `当前区域（cn-north-4）无 DCS 实例。` and creates no file.
+
+## 6. Functional smoke (optional, read-only)
 
 With a working hcloud profile:
 

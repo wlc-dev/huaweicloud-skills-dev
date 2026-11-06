@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -9,15 +11,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from list_dcs import (  # noqa: E402
     ALLOWED_OPERATION,
+    MD_COLUMNS,
+    MD_HEADERS,
+    MODE_JSON,
+    MODE_MD,
+    MODE_NAMES,
+    MODE_TABLE,
     ApiError,
     AuthError,
     ConfigError,
     DcsListError,
     GuardError,
+    OutputError,
     build_command,
     classify_hcloud_failure,
     extract_instances,
     extract_json,
+    guard_argv,
     guard_operation,
     guard_write_intent,
     instance_names,
@@ -25,7 +35,11 @@ from list_dcs import (  # noqa: E402
     list_instances_via_sdk,
     main,
     normalize_instance,
+    normalized_row,
+    render_markdown,
     render_table,
+    resolve_mode,
+    write_markdown_file,
 )
 
 INSTANCE_1 = {
@@ -177,6 +191,32 @@ class TestExtract(unittest.TestCase):
         with self.assertRaises(ApiError):
             extract_json("<html>not json</html>")
 
+    def test_extract_json_ignores_trailing_diagnostic_table(self):
+        stdout = (
+            '{"instances": [], "instance_num": 0}\n'
+            "Failed to get terminal width, use default value 120.\n"
+            "+--------+--------+\n"
+            "| Key    | Value  |\n"
+            "+--------+--------+\n"
+        )
+        self.assertEqual(extract_json(stdout), {"instances": [], "instance_num": 0})
+
+    def test_extract_json_error_body_with_diagnostic_table(self):
+        # DCS error body + KooCLI diagnostic table, rc=0: the first complete
+        # JSON object must be decoded and surfaced as an explicit API error.
+        stdout = (
+            '{"error_msg": "Invalid status parameter in the request.", '
+            '"error_code": "DCS.4062"}\n'
+            "Failed to get terminal width, use default value 120.\n"
+            "+--------+--------+\n"
+            "| Key    | Value  |\n"
+            "+--------+--------+\n"
+        )
+        with self.assertRaises(ApiError) as ctx:
+            extract_json(stdout)
+        self.assertIn("DCS.4062", str(ctx.exception))
+        self.assertIn("Invalid status parameter", str(ctx.exception))
+
     def test_extract_instances_known_keys(self):
         for key in ("instances", "instance_list"):
             self.assertEqual(extract_instances({key: [INSTANCE_1]}), [INSTANCE_1])
@@ -275,6 +315,23 @@ class TestListInstances(unittest.TestCase):
             with self.assertRaises(ApiError) as ctx:
                 list_instances("cn-north-4")
         self.assertIn("参数错误", str(ctx.exception))
+
+    def test_error_body_rc0_with_diagnostic_table_raises_api_error(self):
+        # Regression: DCS parameter errors come back as an error body on
+        # stdout with rc=0 plus a trailing diagnostic table; they must be
+        # reported as an API error (with error_code), not a parse failure.
+        fake = FakeRunner([(
+            '{"error_msg": "Invalid status parameter in the request.", '
+            '"error_code": "DCS.4062"}\n'
+            "Failed to get terminal width, use default value 120.\n"
+            "+--------+--------+\n"
+            "| Key    | Value  |\n"
+            "+--------+--------+\n", "", 0)])
+        with mock.patch("list_dcs.subprocess.run", fake):
+            with self.assertRaises(ApiError) as ctx:
+                list_instances("cn-north-4", status="INVALID_STATUS")
+        self.assertIn("DCS.4062", str(ctx.exception))
+        self.assertIn("Invalid status parameter", str(ctx.exception))
 
     def test_nonzero_exit_403(self):
         fake = FakeRunner([("", "403 Forbidden", 1)])
@@ -676,6 +733,238 @@ class TestMain(unittest.TestCase):
         rc, out, err = self._run(["--status", "deleting-now"], [])
         self.assertEqual(rc, 1)
         self.assertIn("写操作意图", err)
+
+
+class TestMarkdownOutput(unittest.TestCase):
+    """Markdown mode (--md / --format md / --md-output)."""
+
+    HEADER_LINE = "| " + " | ".join([
+        "名称", "ID", "引擎", "版本", "容量", "规格", "状态",
+        "连接地址", "端口", "可用区"]) + " |"
+    SEPARATOR_LINE = "| " + " | ".join(["---"] * 10) + " |"
+    PAYLOAD = json.dumps({"instances": [INSTANCE_1, INSTANCE_2],
+                          "instance_num": 2})
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="dcs-md-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_dcs.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    # --- column contract -------------------------------------------------
+    def test_headers_are_the_export_markdown_ten_columns(self):
+        # Must stay byte-identical to huawei-cloud-dcs-export-markdown.
+        self.assertEqual(MD_HEADERS, [
+            "名称", "ID", "引擎", "版本", "容量", "规格", "状态",
+            "连接地址", "端口", "可用区"])
+        self.assertEqual(len(MD_HEADERS), 10)
+        self.assertEqual(len(MD_COLUMNS), len(MD_HEADERS))
+
+    def test_row_column_order_and_values(self):
+        row = normalized_row(INSTANCE_1)
+        self.assertEqual(len(row), 10)
+        self.assertEqual(row[0], "cache-demo-01")
+        self.assertEqual(row[1], "55f47f3d-0001-4a54-a362-a07c9d7f7a02")
+        self.assertEqual(row[2], "Redis")
+        self.assertEqual(row[3], "5.0")
+        self.assertEqual(row[4], "4")
+        self.assertEqual(row[5], "redis.ha.xu1.large.r2.4-h")
+        self.assertEqual(row[6], "RUNNING")
+        self.assertEqual(row[7], "192.168.0.10")
+        self.assertEqual(row[8], "6379")
+        self.assertEqual(row[9], "cn-north-4a")
+
+    def test_missing_fields_render_dash(self):
+        row = normalized_row({"instance_id": "id-only"})
+        self.assertEqual(row, ["-", "id-only", "-", "-", "-", "-", "-",
+                               "-", "-", "-"])
+
+    def test_pipe_and_newline_are_escaped(self):
+        row = normalized_row({"name": "a|b", "status": "RUN\nNING",
+                              "spec_code": "x\r\ny"})
+        self.assertEqual(row[0], "a\\|b")
+        self.assertEqual(row[6], "RUN NING")
+        self.assertEqual(row[5], "x  y")
+
+    def test_render_markdown_table_shape(self):
+        text = render_markdown([INSTANCE_1, INSTANCE_2])
+        lines = text.split("\n")
+        self.assertEqual(len(lines), 4)  # header + separator + 2 rows
+        self.assertEqual(lines[0], self.HEADER_LINE)
+        self.assertEqual(lines[1], self.SEPARATOR_LINE)
+        self.assertTrue(lines[2].startswith("| cache-demo-01 |"))
+        self.assertTrue(lines[2].endswith(" |"))
+        self.assertEqual(lines[2].count(" | "), 9)  # 10 cells
+
+    # --- CLI behaviour ---------------------------------------------------
+    def test_md_flag_prints_valid_table(self):
+        rc, out, err = self._run(["--md"], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        lines = out.strip("\n").split("\n")
+        self.assertEqual(lines[0], self.HEADER_LINE)
+        self.assertEqual(lines[1], self.SEPARATOR_LINE)
+        self.assertIn("cache-demo-01", lines[2])
+        self.assertIn("cache-demo-02", lines[3])
+
+    def test_format_md_matches_md_flag(self):
+        _, out_flag, _ = self._run(["--md"], [(self.PAYLOAD, "", 0)])
+        _, out_fmt, _ = self._run(["--format", "md"], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(out_flag, out_fmt)
+
+    def test_format_values_select_each_mode(self):
+        cases = {
+            "names": "DCS 实例名称列表",
+            "table": "完整字段",
+            "md": "| 名称 | ID |",
+        }
+        for fmt, marker in cases.items():
+            rc, out, _ = self._run(["--format", fmt], [(self.PAYLOAD, "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertIn(marker, out)
+        rc, out, _ = self._run(["--format", "json"], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(json.loads(out), [INSTANCE_1, INSTANCE_2])
+
+    def test_md_combines_with_filters_and_page_size(self):
+        fake = FakeRunner([(self.PAYLOAD, "", 0)])
+        with mock.patch("list_dcs.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, mock.patch("sys.stderr"):
+            rc = main(["--md", "--status", "RUNNING", "--page-size", "10"])
+        self.assertEqual(rc, 0)
+        call = " ".join(fake.calls[0])
+        self.assertIn("--status=RUNNING", call)
+        self.assertIn("--limit=10", call)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        self.assertIn(self.HEADER_LINE, out)
+
+    def test_empty_md_prints_hint_without_header_or_file(self):
+        target = os.path.join(self.tmpdir, "empty.md")
+        rc, out, err = self._run(
+            ["--md", "--md-output", target, "--status", "RUNNING"],
+            [(json.dumps({"instances": [], "instance_num": 0}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("无 DCS 实例", out)
+        self.assertIn("status=RUNNING", out)
+        self.assertNotIn("|", out)
+        self.assertFalse(os.path.exists(target))
+
+    def test_md_output_writes_identical_content(self):
+        target = os.path.join(self.tmpdir, "dcs.md")
+        rc, out, err = self._run(
+            ["--md", "--md-output", target], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        with open(target, encoding="utf-8") as handle:
+            written = handle.read()
+        self.assertEqual(written, out)
+        self.assertIn("[已写入]", err)
+
+    def test_md_output_write_failure_is_nonzero_and_leaves_nothing(self):
+        target = os.path.join(self.tmpdir, "sub", "dcs.md")
+        with mock.patch("list_dcs.os.replace", side_effect=OSError("disk full")):
+            rc, out, err = self._run(
+                ["--md", "--md-output", target], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 1)
+        self.assertIn("[错误]", err)
+        self.assertIn("未留下残缺文件", err)
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(
+            [n for n in os.listdir(os.path.dirname(target))
+             if n.endswith(".tmp")], [])
+
+    def test_md_output_rejected_outside_md_mode(self):
+        rc, out, err = self._run(
+            ["--table", "--md-output", os.path.join(self.tmpdir, "x.md")], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("--md-output", err)
+
+    def test_md_mode_still_blocks_write_intent(self):
+        rc, out, err = self._run(["--md", "--name", "delete-me"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("守卫拦截", err)
+
+    def test_md_output_path_write_word_not_blocked(self):
+        # The local output path is not a DCS operation.
+        target = os.path.join(self.tmpdir, "dcs-backup-restore.md")
+        rc, out, err = self._run(
+            ["--md", "--md-output", target], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(target))
+
+    def test_guard_argv_strips_md_output_value(self):
+        self.assertFalse(guard_argv(["--md", "--md-output", "/tmp/delete-me.md"]))
+        self.assertFalse(guard_argv(["--md", "--md-output=/tmp/delete-me.md"]))
+        with self.assertRaises(GuardError):
+            guard_argv(["--md", "--name", "delete-me"])
+
+    # --- legacy outputs stay byte-identical ------------------------------
+    def test_legacy_outputs_unchanged(self):
+        rc, names_out, _ = self._run([], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(names_out,
+                         "Region cn-north-4 的 DCS 实例名称列表（共 2 个）：\n"
+                         "- cache-demo-01\n- cache-demo-02\n")
+        rc, table_out, _ = self._run(["--table"], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(table_out,
+                         "Region cn-north-4 的 DCS 实例列表（共 2 个，完整字段）：\n"
+                         + render_table([INSTANCE_1, INSTANCE_2]) + "\n")
+        rc, json_out, _ = self._run(["--json"], [(self.PAYLOAD, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json_out,
+                         json.dumps([INSTANCE_1, INSTANCE_2],
+                                    ensure_ascii=False, indent=2) + "\n")
+
+
+class TestResolveMode(unittest.TestCase):
+    def test_default_is_names(self):
+        self.assertEqual(resolve_mode(), MODE_NAMES)
+
+    def test_flag_precedence_is_backwards_compatible(self):
+        # json > names-only > table > md > --format > default
+        self.assertEqual(resolve_mode("md", as_json=True, as_md=True), MODE_JSON)
+        self.assertEqual(resolve_mode("md", names_only=True, as_table=True),
+                         MODE_NAMES)
+        self.assertEqual(resolve_mode("md", as_table=True, as_md=True), MODE_TABLE)
+        self.assertEqual(resolve_mode("table", as_md=True), MODE_MD)
+
+    def test_format_value_used_without_flags(self):
+        self.assertEqual(resolve_mode("md"), MODE_MD)
+        self.assertEqual(resolve_mode("table"), MODE_TABLE)
+        self.assertEqual(resolve_mode("json"), MODE_JSON)
+
+
+class TestMarkdownFileHelper(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="dcs-md-helper-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def test_writes_and_creates_parent_dir(self):
+        target = os.path.join(self.tmpdir, "a", "b", "out.md")
+        path = write_markdown_file("| a |", target)
+        self.assertEqual(path, os.path.abspath(target))
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "| a |\n")
+
+    def test_failure_raises_output_error_and_cleans_temp(self):
+        target = os.path.join(self.tmpdir, "out.md")
+        with mock.patch("list_dcs.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OutputError):
+                write_markdown_file("| a |", target)
+        self.assertEqual([n for n in os.listdir(self.tmpdir)
+                          if n.endswith(".tmp")], [])
+        self.assertFalse(os.path.exists(target))
+
+    def test_empty_path_rejected(self):
+        with self.assertRaises(OutputError):
+            write_markdown_file("| a |", "")
 
 
 class TestErrorHierarchy(unittest.TestCase):

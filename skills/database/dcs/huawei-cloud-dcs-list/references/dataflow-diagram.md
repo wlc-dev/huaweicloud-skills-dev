@@ -24,5 +24,7 @@ flowchart TD
     K -->|--names-only / default| N[compact instance-name list]
     K -->|--json| M[raw instance array JSON]
     K -->|--table| O[full-field table: 名称/ID/引擎/容量/状态/连接地址/端口]
-    K -->|empty| P[当前区域无 DCS 实例 hint, exit 0]
+    K -->|--md / --format md| Q[Markdown table: fixed 10 columns, `-` for missing, pipe/newline escaped]
+    Q -->|--md-output path| R[temp file + atomic rename → .md file, content == stdout]
+    K -->|empty| P[当前区域无 DCS 实例 hint, exit 0, no header / no file]
 ```

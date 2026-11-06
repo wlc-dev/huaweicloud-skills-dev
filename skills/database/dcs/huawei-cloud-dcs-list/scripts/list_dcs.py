@@ -4,16 +4,25 @@ via KooCLI `hcloud DCS ListInstances` (read-only GET /v2/{project_id}/instances)
 
 Primary execution path is KooCLI; when hcloud is not installed, the script falls
 back to the official `huaweicloudsdkdcs` v2 SDK (`DcsClient.list_instances`).
-Reads nothing but the active credential profile / environment. Supports three
-output modes (--names-only / table / --json), --name / --instance-id / --ip /
---status / --tags filtering and automatic --limit / --offset paging (the real
-ListInstances API parameters, verified against `hcloud DCS ListInstances
---help` and the huaweicloudsdkdcs v2 ListInstancesRequest model), plus a strict
-write-intent guard: any argument that looks like a mutating DCS operation is
-rejected before a single command is executed.
+Reads nothing but the active credential profile / environment. Supports four
+output modes (--names-only / table / --json / Markdown table), --name /
+--instance-id / --ip / --status / --tags filtering and automatic --limit /
+--offset paging (the real ListInstances API parameters, verified against
+`hcloud DCS ListInstances --help` and the huaweicloudsdkdcs v2
+ListInstancesRequest model), plus a strict write-intent guard: any argument
+that looks like a mutating DCS operation is rejected before a single command
+is executed.
+
+Markdown mode (--md / --format md) prints a GitHub-flavored table whose ten
+columns match huawei-cloud-dcs-export-markdown verbatim (名称/ID/引擎/版本/
+容量/规格/状态/连接地址/端口/可用区, missing values rendered as "-"), and can
+optionally persist exactly that text with --md-output <path> (temp file +
+atomic rename).
 
 Usage:
-    python3 scripts/list_dcs.py [--region cn-north-4] [--names-only | --json]
+    python3 scripts/list_dcs.py [--region cn-north-4]
+                                 [--names-only | --table | --json | --md]
+                                 [--format names|table|json|md] [--md-output <path>]
                                  [--name cache] [--instance-id <id>] [--ip <ip>]
                                  [--status RUNNING] [--tags env=prod]
                                  [--page-size 100] [--operation ListInstances]
@@ -29,12 +38,46 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+
+# Keep the shipped skill directory clean: never emit __pycache__/*.pyc.
+sys.dont_write_bytecode = True
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
 SERVICE = "DCS"
 ALLOWED_OPERATION = "ListInstances"
 REST_PATH = "/v2/{project_id}/instances"
+
+# Output modes (--format values + the legacy boolean flags).
+MODE_NAMES = "names"
+MODE_TABLE = "table"
+MODE_JSON = "json"
+MODE_MD = "md"
+MODE_CHOICES = (MODE_NAMES, MODE_TABLE, MODE_JSON, MODE_MD)
+DEFAULT_MODE = MODE_NAMES
+
+# Markdown table contract — kept byte-identical to
+# huawei-cloud-dcs-export-markdown/scripts/export_markdown.py::MD_HEADERS so
+# both skills describe a DCS instance with the same ten columns.
+MD_HEADERS = [
+    "名称", "ID", "引擎", "版本", "容量", "规格", "状态", "连接地址", "端口", "可用区",
+]
+# One column spec per MD_HEADERS entry; the first key present wins.
+MD_COLUMNS = (
+    ("name",),
+    ("instance_id", "id"),
+    ("engine",),
+    ("engine_version",),
+    ("capacity",),
+    ("spec_code",),
+    ("status",),
+    ("ip",),
+    ("port",),
+    ("az_codes",),
+)
+# Fallback marker used when a per-instance field was not returned by DCS.
+MD_FIELD_MISSING = "-"
 
 # Mutating DCS operations / intents — strictly rejected by the guard.
 WRITE_INTENT_KEYWORDS = (
@@ -212,7 +255,8 @@ def build_command(region, name=None, instance_id=None, ip=None, status=None,
                   tags=None, limit=DEFAULT_PAGE_SIZE, offset=0):
     """Build the hcloud DCS ListInstances argv (without the executable).
 
-    Mirrors the real KooCLI parameter list (`hcloud DCS ListInstances --help`):
+    Mirrors the real KooCLI parameter list (verified in the DCS
+    ListInstances help output):
     --cli-region / --name / --instance_id / --ip / --status / --tags are all
     real server-side query parameters; paging uses --limit (1..1000, default
     10 per page when unset) + --offset. The marker is never sent on the first
@@ -264,21 +308,59 @@ def run_hcloud(argv):
     return proc.stdout or "", proc.stderr or "", proc.returncode
 
 
+def _payload_error(payload):
+    """Map an API error body returned with exit code 0 to a domain error.
+
+    KooCLI can print the DCS error body on stdout and still exit 0, so the
+    payload must be inspected before any success handling. A normal
+    ListInstances response never carries error_code/error_msg, so those keys
+    are an unambiguous error marker.
+    """
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("error_code")
+    msg = payload.get("error_msg") or payload.get("error_message")
+    if not code and not msg:
+        return None
+    detail = "DCS API 错误 %s: %s" % (code or "-", msg or "-")
+    blob = ("%s %s" % (code or "", msg or "")).lower()
+    if any(pattern in blob for pattern in _AUTH_PATTERNS):
+        return AuthError(
+            "无权限访问分布式缓存服务（DCS），请检查 IAM 权限"
+            "（403：AK/SK 无效或未授予 DCS 只读权限），"
+            "参见 references/iam-policies.md。详情：%s" % detail
+        )
+    return ApiError(detail)
+
+
 def extract_json(stdout):
-    """Parse hcloud stdout as JSON; tolerate wrapper/noise lines."""
+    """Parse hcloud stdout as JSON; tolerate wrapper/noise lines.
+
+    KooCLI may append a diagnostic table after the JSON body, so the first
+    complete JSON value is decoded starting at the first ``{`` instead of
+    slicing through the last ``}`` (which the trailing table would break).
+    An error body returned with exit code 0 is raised as an API/auth error
+    rather than being reported as unparseable output.
+    """
     text = stdout.strip()
     if not text:
         return {}
     try:
-        return json.loads(text)
+        payload = json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
+        payload = None
+        start = text.find("{")
+        if start >= 0:
             try:
-                return json.loads(text[start:end + 1])
+                payload, _end = json.JSONDecoder().raw_decode(text, start)
             except json.JSONDecodeError:
-                pass
-        raise ApiError("hcloud 输出无法解析为 JSON：%s" % text[:200])
+                payload = None
+        if payload is None:
+            raise ApiError("hcloud 输出无法解析为 JSON：%s" % text[:200])
+    error = _payload_error(payload)
+    if error is not None:
+        raise error
+    return payload
 
 
 def classify_hcloud_failure(stdout, stderr, returncode):
@@ -569,6 +651,149 @@ def render_table(instances):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- Markdown ---
+
+def _md_escape(value):
+    """Render one Markdown cell; ``-`` for missing data, no table-breaking chars.
+
+    Pipes and line breaks are neutralized so a value can never split a row or
+    inject an extra column; missing values follow the export-markdown rule.
+    """
+    if value is None or value == "":
+        return MD_FIELD_MISSING
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def normalized_row(instance):
+    """Map a DCS instance to the fixed ten-column Markdown order."""
+    flat = normalize_instance(instance)
+    row = []
+    for keys in MD_COLUMNS:
+        value = _field(flat, *keys, default=None)
+        row.append(_md_escape(value))
+    return row
+
+
+def render_markdown(instances):
+    """Render the instance list as a GitHub-flavored Markdown table.
+
+    The header row and separator are emitted only when there is at least one
+    instance (callers print the empty hint instead and never write a file).
+    """
+    lines = [
+        "| " + " | ".join(MD_HEADERS) + " |",
+        "| " + " | ".join(["---"] * len(MD_HEADERS)) + " |",
+    ]
+    for instance in instances:
+        lines.append("| " + " | ".join(normalized_row(instance)) + " |")
+    return "\n".join(lines)
+
+
+class OutputError(DcsListError):
+    """The Markdown output file could not be written."""
+
+
+def write_markdown_file(text, output_path):
+    """Write ``text`` to ``output_path`` atomically; returns the absolute path.
+
+    A temp file inside the destination directory is fsynced and renamed over
+    the target, so an interrupted/failed write never leaves a partial file.
+    """
+    if not output_path:
+        raise OutputError("--md-output 需要非空的文件路径。")
+    path = os.path.abspath(output_path)
+    out_dir = os.path.dirname(path) or "."
+    tmp_path = None
+    try:
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".dcs_list_md.", suffix=".tmp", dir=out_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            if not text.endswith("\n"):
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        raise OutputError(
+            "Markdown 文件写入失败（%s）：%s。未留下残缺文件。" % (path, exc)
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return path
+
+
+# ------------------------------------------------------- mode / empty hint ---
+
+def resolve_mode(fmt=None, as_json=False, as_table=False, names_only=False,
+                 as_md=False):
+    """Resolve the effective output mode, keeping the legacy precedence.
+
+    Backwards compatible order: ``--json`` > ``--names-only`` (default) >
+    ``--table`` > ``--md`` > ``--format`` value > default names list.
+    """
+    if as_json:
+        return MODE_JSON
+    if names_only:
+        return MODE_NAMES
+    if as_table:
+        return MODE_TABLE
+    if as_md:
+        return MODE_MD
+    if fmt:
+        return fmt
+    return DEFAULT_MODE
+
+
+def _empty_hint(region, args):
+    """Build the shared 「无 DCS 实例」 hint (identical text for all modes)."""
+    filters = []
+    if args.name:
+        filters.append("name=%s" % args.name)
+    if args.instance_id:
+        filters.append("instance_id=%s" % args.instance_id)
+    if args.ip:
+        filters.append("ip=%s" % args.ip)
+    if args.status:
+        filters.append("status=%s" % args.status)
+    if args.tags:
+        filters.append("tags=%s" % args.tags)
+    suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
+    return "当前区域（%s）无 DCS 实例%s。" % (region, suffix)
+
+
+# The local Markdown output path is not a DCS operation — it is stripped from
+# the write-intent scan so a path such as ``.../dcs-backup.md`` never trips it.
+_MD_OUTPUT_FLAGS = ("--md-output", "--md_output")
+
+
+def guard_argv(argv):
+    """Scan user argv for write intent, ignoring the local --md-output value."""
+    tokens = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        name = str(token)
+        if name in _MD_OUTPUT_FLAGS:
+            skip_next = True
+            continue
+        if name.startswith("--md-output=") or name.startswith("--md_output="):
+            continue
+        tokens.append(name)
+    return guard_write_intent(" ".join(tokens))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="查询华为云 DCS（分布式缓存服务）实例列表"
@@ -581,6 +806,13 @@ def main(argv=None):
                         help="以 JSON 输出完整原始字段")
     parser.add_argument("--table", action="store_true", dest="as_table",
                         help="输出全字段表格（名称/ID/引擎/容量/状态/连接地址/端口等）")
+    parser.add_argument("--md", action="store_true", dest="as_md",
+                        help="输出 Markdown 表格（固定 10 列，与 dcs-export-markdown 口径一致）")
+    parser.add_argument("--format", dest="fmt", choices=MODE_CHOICES,
+                        default=None,
+                        help="输出格式：names（默认）/ table / json / md")
+    parser.add_argument("--md-output", dest="md_output", default=None,
+                        help="md 模式可选：把表格原子写入该 .md 文件（内容与 stdout 一致）")
     parser.add_argument("--name",
                         help="按实例名称过滤（服务端查询参数，模糊匹配；"
                              "name_equal 精确匹配开关由 --name-equal 提供）")
@@ -605,7 +837,8 @@ def main(argv=None):
 
     try:
         # Write-intent guard: scan the raw argv + validate the operation name.
-        guard_write_intent(" ".join(argv if argv is not None else sys.argv[1:]))
+        # The local --md-output path is excluded (it is not a DCS operation).
+        guard_argv(argv if argv is not None else sys.argv[1:])
         guard_operation(args.operation)
         for value in (args.name, args.instance_id, args.ip, args.status, args.tags):
             if value:
@@ -613,6 +846,13 @@ def main(argv=None):
         if args.page_size is not None:
             if args.page_size < 1 or args.page_size > 1000:
                 raise ApiError("--page-size 超出范围（1~1000）：%d" % args.page_size)
+        mode = resolve_mode(args.fmt, as_json=args.as_json,
+                            as_table=args.as_table, names_only=args.names_only,
+                            as_md=args.as_md)
+        if args.md_output and mode != MODE_MD:
+            raise ApiError(
+                "--md-output 仅在 Markdown 模式（--md / --format md）下可用，"
+                "当前输出模式为 %s。" % mode)
         instances = list_instances(
             args.region,
             name=args.name if not args.name_equal else None,
@@ -638,46 +878,30 @@ def main(argv=None):
         else:
             instances = []
 
-    if args.as_json:
+    if mode == MODE_JSON:
         print(json.dumps(instances, ensure_ascii=False, indent=2))
         return 0
 
-    # Default output mode: the compact instance-name list (--names-only).
-    if args.names_only or not args.as_table:
-        if not instances:
-            filters = []
-            if args.name:
-                filters.append("name=%s" % args.name)
-            if args.instance_id:
-                filters.append("instance_id=%s" % args.instance_id)
-            if args.ip:
-                filters.append("ip=%s" % args.ip)
-            if args.status:
-                filters.append("status=%s" % args.status)
-            if args.tags:
-                filters.append("tags=%s" % args.tags)
-            suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
-            print("当前区域（%s）无 DCS 实例%s。" % (args.region, suffix))
-            return 0
+    if not instances:
+        print(_empty_hint(args.region, args))
+        return 0
+
+    if mode == MODE_NAMES:
         print("Region %s 的 DCS 实例名称列表（共 %d 个）：" % (args.region, len(instances)))
         for name in instance_names(instances):
             print("- %s" % name)
         return 0
 
-    if not instances:
-        filters = []
-        if args.name:
-            filters.append("name=%s" % args.name)
-        if args.instance_id:
-            filters.append("instance_id=%s" % args.instance_id)
-        if args.ip:
-            filters.append("ip=%s" % args.ip)
-        if args.status:
-            filters.append("status=%s" % args.status)
-        if args.tags:
-            filters.append("tags=%s" % args.tags)
-        suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
-        print("当前区域（%s）无 DCS 实例%s。" % (args.region, suffix))
+    if mode == MODE_MD:
+        text = render_markdown(instances)
+        print(text)
+        if args.md_output:
+            try:
+                written = write_markdown_file(text, args.md_output)
+            except DcsListError as exc:
+                print("[错误] %s" % exc, file=sys.stderr)
+                return 1
+            print("[已写入] %s" % written, file=sys.stderr)
         return 0
 
     print("Region %s 的 DCS 实例列表（共 %d 个，完整字段）：" % (args.region, len(instances)))
