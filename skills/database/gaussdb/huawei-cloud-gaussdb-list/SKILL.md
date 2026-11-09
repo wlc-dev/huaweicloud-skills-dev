@@ -9,7 +9,9 @@ description: |
      (`GaussDBClient.list_gauss_my_sql_instances`) when KooCLI is not installed.
   2. Default output is an aligned Chinese-header table
      (名称/实例ID/状态/引擎/引擎版本/规格/CPU内存/存储类型/存储/私网IP/公网IP/
-     端口/类型/区域/VPC/子网/创建时间); `--json` prints the raw instance array.
+     端口/类型/区域/VPC/子网/创建时间); `--json` prints the raw instance array;
+     `--format md` / `-o FILE` exports the same fields as a Markdown table file
+     (default `gaussdb_instances_<region>_<timestamp>.md`).
   3. Supports `--region` override (default cn-north-4), `--name` server-side
      fuzzy filtering (a leading `*` is added when missing), `--status`
      client-side exact filtering (the real API has no status parameter), and
@@ -45,7 +47,7 @@ Architecture:
 agent → python3 scripts/list_gaussdb.py
       → hcloud GaussDB ListGaussMySqlInstances --cli-region=<region> --limit=N --offset=O
       → Huawei Cloud GaussDB OpenAPI (gaussdb.<region>.myhuaweicloud.com)
-      → parsed JSON instances → local status filter → table / --json
+      → parsed JSON instances → local status filter → table / --json / Markdown file
 
 (hcloud binary missing) → fallback: huaweicloudsdkgaussdb v3 GaussDBClient.list_gauss_my_sql_instances
 ```
@@ -61,9 +63,11 @@ Key properties:
   KooCLI binary is absent, the script falls back to the official
   `huaweicloudsdkgaussdb` v3 SDK. Credentials are always read by the CLI
   profile / whitelisted SDK environment variables — never handled by the script.
-- **Table by default, JSON on demand** — the default output is an aligned table
-  with the common GaussDB fields; `--json` prints the raw instance array for
-  downstream tooling.
+- **Table by default, JSON / Markdown on demand** — the default output is an
+  aligned table with the common GaussDB fields; `--json` prints the raw instance
+  array for downstream tooling; `--format md` / `-o FILE` writes the same fields
+  as a Markdown table file (atomic write, pipe/newline escaping, default name
+  `gaussdb_instances_<region>_<timestamp>.md`).
 - **Server-side fuzzy name filter & automatic paging** — `--name` is the real
   `ListGaussMySqlInstances` query parameter; the API only performs fuzzy
   matching when the value starts with `*`, so the script adds the leading `*`
@@ -133,6 +137,14 @@ python3 scripts/list_gaussdb.py --region cn-south-1 --name gauss --status ACTIVE
 
 # Automatic paging; page size is tunable (1~100, default 100)
 python3 scripts/list_gaussdb.py --page-size 50
+
+# Export the instance list to a Markdown table file
+python3 scripts/list_gaussdb.py --format md --output reports/gaussdb_instances.md
+# --output alone implies --format md (default file name in the current dir)
+python3 scripts/list_gaussdb.py --output gaussdb_instances.md
+
+# Default Markdown file name: gaussdb_instances_<region>_<timestamp>.md
+python3 scripts/list_gaussdb.py --format md --region cn-south-1
 ```
 
 Equivalent direct KooCLI command (the script wraps exactly this call, with
@@ -160,9 +172,13 @@ hcloud GaussDB ListGaussMySqlInstances --cli-region=cn-north-4 --name=*gauss-dem
 | `--page-size` | No | Page size for ListGaussMySqlInstances (default 100, range 1–100; pages are fetched automatically) | `50` |
 | `--project-id` | No | Project ID (needed by the SDK fallback path for `/v3/{project_id}/instances`) | `05f...` |
 | `--operation` | No | hcloud GaussDB operation name; only `ListGaussMySqlInstances` is allowed | `ListGaussMySqlInstances` |
+| `--format` | No | Output format: `table` (default, aligned terminal table) or `md` (Markdown file) | `md` |
+| `-o` / `--output` | No | Markdown output file path (implies `--format md`); default `gaussdb_instances_<region>_<timestamp>.md` in the current directory | `reports/gaussdb_instances.md` |
 
 Output-mode precedence: `--json` wins over the default table mode. Without any
-mode flag the script prints the aligned table.
+mode flag the script prints the aligned table. `--format md` / `--output` is
+mutually exclusive with `--json` and `--table` (explicit parameter error, exit
+code 2); `--output` is equivalent to `--format md`.
 
 ## Write-Intent Guard
 
@@ -223,8 +239,12 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 | KooCLI usage error (`[USE_ERROR] ...`, even with exit code 0) | Exit 1, explicit `hcloud 参数错误` hint pointing to `hcloud GaussDB ListGaussMySqlInstances --help` |
 | `--page-size` out of range (not 1~100) | Exit 1, explicit range error before any call |
 | Write intent detected | Exit 1, `GuardError` message, no command executed |
+| Markdown export with empty result | Exit 0, file contains the table header + separator and an explicit 「无 GaussDB 实例」 note |
+| Markdown file write failure (unwritable path / disk error) | Exit 1, `[错误] Markdown 文件写出失败 (...)`, no partial file left behind |
+| `--format md` / `--output` combined with `--json` or `--table` | Exit 2, explicit parameter error `不能同时使用` |
 
-Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
+Exit codes: `0` success / empty region; `1` config, auth, guard, API, or
+Markdown write error; `2` argument error.
 
 ## Edge Cases
 
@@ -241,6 +261,9 @@ Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
 | Instance without a name | Table renders `-` for name but keeps the instance ID |
 | Non-JSON hcloud output | `ApiError` with the raw excerpt (first 200 chars) |
 | hcloud absent, SDK installed | Transparent fallback to `huaweicloudsdkgaussdb` list_gauss_my_sql_instances, same output modes |
+| Markdown cell containing `|` or newlines | Escaped as `\|` / collapsed to spaces so the table stays valid |
+| Missing `--output` directory | Parent directories are created automatically |
+| Existing file at the output path | Overwritten atomically (temp file + rename; never a partial file) |
 | User asks to create/delete/resize/restart | Out of scope — blocked by the write-intent guard; a write-capable skill with explicit user confirmation is required |
 
 ## Testing
@@ -256,9 +279,12 @@ filter / paging — all `GET`), and the structure checks are listed in
 python3 scripts/list_gaussdb.py --region cn-north-4
 python3 scripts/list_gaussdb.py --json | python3 -m json.tool >/dev/null
 python3 scripts/list_gaussdb.py --name gauss --status ACTIVE
+
+# Markdown export (unit-testable offline; no cloud call for render/write paths)
+python3 scripts/list_gaussdb.py --format md --output /tmp/gaussdb_instances.md
 ```
 
-Expected: a table (or raw JSON array); an explicit
+Expected: a table (or raw JSON array, or a Markdown file); an explicit
 `当前区域（cn-north-4）无 GaussDB 实例` message on an empty region; an explicit
 IAM hint on 403. Detailed method and provenance:
 [references/verification-method.md](references/verification-method.md).

@@ -22,3 +22,13 @@
 | 18 | Read-only REST path provenance documented (`GET /v3/{project_id}/instances`) | ✅ verification-method.md |
 | 19 | No hardcoded credentials; SKILL.md ≤ 500 lines, files ≤ 30, size ≤ 40 MB, extension allowlist | ✅ |
 | 20 | Does not duplicate the GaussDB(for openGauss) variant covered by another skill | ✅ scope note |
+| 21 | Backward compatible: without export flags the output is unchanged (aligned table; `--json` raw array) | ✅ `main` / `render_table` |
+| 22 | `--format md` / `-o` / `--output FILE` writes a valid Markdown table (Chinese header + separator + data rows), content matching the query result | ✅ `render_markdown` |
+| 23 | Markdown columns cover 名称/实例ID/状态/引擎/引擎版本/内核版本/规格/CPU内存/存储类型/存储/私网IP/公网IP/端口/类型/区域/VPC/子网/创建时间 | ✅ `MD_COLUMNS` |
+| 24 | Default file name `gaussdb_instances_<region>_<timestamp>.md`; custom path supported; parent directories created | ✅ `default_output_path` / `write_markdown` |
+| 25 | Empty result exports only the table header + separator plus an explicit 「无 GaussDB 实例」 note (exit 0) | ✅ `render_markdown` |
+| 26 | Write failure prints `[错误] Markdown 文件写出失败 (...)` and exits non-zero, leaving no partial/temp file | ✅ `write_markdown` (temp file + `os.replace`) |
+| 27 | Markdown cells escape `\|` and collapse newlines | ✅ `_md_cell` |
+| 28 | `--format md` / `--output` is mutually exclusive with `--json` / `--table` (explicit parameter error, exit 2); `--output` implies `--format md` | ✅ `main` (`parser.error`) |
+| 29 | Unit tests cover export success, empty result, write failure, escaping, default name and parameter mutual exclusion | ✅ `tests/test_list_gaussdb.py` |
+| 30 | SKILL.md and this acceptance-criteria document describe the Markdown export | ✅ |

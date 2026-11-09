@@ -15,6 +15,8 @@ Output modes:
   * default / --table  aligned Chinese-header table
                        (名称/ID/状态/引擎版本/规格/存储/可用区等)
   * --json             raw instance array as returned by the API
+  * --format md        Markdown table written to a file (--output FILE),
+                       default name gaussdb_instances_<region>_<timestamp>.md
 
 Filters:
   * --name     server-side fuzzy query (a leading ``*`` is added when missing)
@@ -24,6 +26,7 @@ Filters:
 Usage:
     python3 scripts/list_gaussdb.py [--region cn-north-4]
                                     [--table | --json]
+                                    [--format table|md] [-o/--output FILE]
                                     [--name gauss-demo] [--status ACTIVE]
                                     [--page-size 100] [--project-id <id>]
                                     [--operation ListGaussMySqlInstances]
@@ -34,11 +37,13 @@ Environment overrides (mostly for tests):
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 
 # Keep the shipped skill directory clean: never emit __pycache__/*.pyc.
 sys.dont_write_bytecode = True
@@ -47,16 +52,40 @@ DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 100
 MAX_PAGES = 100
+DEFAULT_OUTPUT_TEMPLATE = "gaussdb_instances_%s_%s.md"
 SERVICE = "GaussDB"
 ALLOWED_OPERATION = "ListGaussMySqlInstances"
 REST_PATH = "/v3/{project_id}/instances"
 
 MODE_TABLE = "table"
 MODE_JSON = "json"
+MODE_MD = "md"
 
 # Fixed, human-friendly table columns. Nested SDK/CLI fields are flattened by
 # normalize_instance() before rendering.
 TABLE_COLUMNS = (
+    ("名称", "name"),
+    ("实例ID", "id"),
+    ("状态", "status"),
+    ("引擎", "engine_type"),
+    ("引擎版本", "engine_version"),
+    ("内核版本", "kernel_version"),
+    ("规格", "flavor_ref"),
+    ("CPU/内存", "cpu_mem"),
+    ("存储类型", "volume_type"),
+    ("存储(GB)", "volume_size"),
+    ("私网IP", "private_ips"),
+    ("公网IP", "public_ips"),
+    ("端口", "port"),
+    ("类型", "type"),
+    ("区域", "region"),
+    ("VPC", "vpc_id"),
+    ("子网", "subnet_id"),
+    ("创建时间", "created"),
+)
+# Markdown table columns: header label -> normalized key (same field order as
+# the terminal table so both outputs stay consistent).
+MD_COLUMNS = (
     ("名称", "name"),
     ("实例ID", "id"),
     ("状态", "status"),
@@ -148,6 +177,7 @@ READ_ONLY_VALUE_FLAGS = frozenset((
     "--subnet-id", "--subnet_id",
     "--private-ip", "--private_ip",
     "--format",
+    "--output", "-o",
 ))
 
 _INSTANCE_LIST_KEYS = ("instances", "instance_list", "instance_infos", "instanceInfos")
@@ -678,6 +708,88 @@ def _pad_row(cells, widths):
     return "  ".join(padded).rstrip()
 
 
+def _md_cell(value):
+    """Render one Markdown table cell, escaping pipes and collapsing newlines."""
+    if value is None:
+        value = MISSING
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = text.replace("|", "\\|")
+    return text or MISSING
+
+
+def render_markdown(instances, region, generated_at=None):
+    """Render the instance list as a Markdown document (title + table).
+
+    Columns follow MD_COLUMNS (中文列头); every instance is normalized first so
+    nested ``datastore`` / ``volume`` / ``flavor_info`` / IP fields render as
+    flat cells. The 区域 cell falls back to the queried region when the API
+    response carries no ``region`` field.
+
+    An empty instance list still produces a valid document: the table header +
+    separator followed by an explicit "no instances" note (never an error).
+    """
+    rows_data = [normalize_instance(instance) for instance in instances]
+    header = "| " + " | ".join(label for label, _key in MD_COLUMNS) + " |"
+    separator = "| " + " | ".join("---" for _label, _key in MD_COLUMNS) + " |"
+    lines = [
+        "# 华为云 GaussDB 实例列表 — %s" % region,
+        "",
+        "> Region: %s | Instances: %d" % (region, len(rows_data)),
+    ]
+    if generated_at:
+        lines.append("> Generated at: %s" % generated_at)
+    lines += ["", header, separator]
+    for row in rows_data:
+        cells = []
+        for _label, key in MD_COLUMNS:
+            value = row.get(key)
+            if key == "region" and value in (None, ""):
+                value = region
+            cells.append(_md_cell(value))
+        lines.append("| " + " | ".join(cells) + " |")
+    if not rows_data:
+        lines += ["", "_当前区域（%s）无 GaussDB 实例。_" % region]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def default_output_path(region, now=None):
+    """Default Markdown file name: gaussdb_instances_<region>_<timestamp>.md."""
+    stamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime(
+        "%Y%m%dT%H%M%SZ")
+    return os.path.join(os.getcwd(), DEFAULT_OUTPUT_TEMPLATE % (region, stamp))
+
+
+def write_markdown(content, output_path):
+    """Write ``content`` to ``output_path`` atomically (temp file + rename).
+
+    Missing parent directories are created. An interrupted write never leaves a
+    corrupt / partial file behind.
+    """
+    directory = os.path.dirname(os.path.abspath(output_path))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".gaussdb-md-", suffix=".tmp",
+                                            dir=directory)
+    except (OSError, ValueError) as exc:
+        raise ApiError("Markdown 文件写出失败（目录 %s 不可创建）：%s"
+                       % (directory, exc))
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, output_path)
+    except (OSError, ValueError) as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ApiError("Markdown 文件写出失败（%s）：%s" % (output_path, exc))
+    return output_path
+
+
 def filter_by_status(instances, status):
     """Client-side exact status filter (case-insensitive)."""
     if not status:
@@ -739,7 +851,21 @@ def main(argv=None):
                         help="项目 ID（可选；SDK 回退在 /v3/{project_id}/instances 路径中需要）")
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
                         help="hcloud GaussDB 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+    parser.add_argument("--format", dest="export_format",
+                        choices=(MODE_TABLE, MODE_MD), default=MODE_TABLE,
+                        help="输出格式：table（默认，终端表格）或 md"
+                             "（Markdown 文件，配合 --output）")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Markdown 输出文件路径（隐含 --format md；默认当前目录 "
+                             "gaussdb_instances_<region>_<timestamp>.md）")
     args = parser.parse_args(argv)
+
+    if args.output:
+        args.export_format = MODE_MD
+    if args.export_format == MODE_MD and args.as_json:
+        parser.error("--format md / --output 与 --json 不能同时使用")
+    if args.export_format == MODE_MD and args.as_table:
+        parser.error("--format md / --output 与 --table 不能同时使用")
 
     try:
         guard_argv(argv if argv is not None else sys.argv[1:])
@@ -773,6 +899,24 @@ def main(argv=None):
 
     if args.as_json:
         print(json.dumps(instances, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.export_format == MODE_MD:
+        output_path = args.output or default_output_path(args.region)
+        generated_at = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        try:
+            content = render_markdown(instances, args.region, generated_at)
+            write_markdown(content, output_path)
+        except GaussdbListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        if instances:
+            print("已生成 Markdown 文件：%s（Region %s，共 %d 个 GaussDB 实例）。"
+                  % (os.path.abspath(output_path), args.region, len(instances)))
+        else:
+            print("已生成 Markdown 文件：%s（Region %s 无 GaussDB 实例，已输出表头与"
+                  "空表提示）。" % (os.path.abspath(output_path), args.region))
         return 0
 
     if not instances:
