@@ -1,7 +1,9 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -26,7 +28,9 @@ from list_rds import (  # noqa: E402
     list_instances_via_sdk,
     main,
     normalize_instance,
+    render_markdown,
     render_table,
+    write_markdown,
 )
 
 INSTANCE_1 = {
@@ -377,10 +381,12 @@ class TestSdkFallbackFix(unittest.TestCase):
         self.addCleanup(self._builder_patch.stop)
 
     def _clean_credential_env(self):
-        return {
-            key: value for key, value in os.environ.items()
-            if not key.upper().startswith(("HUAWEI", "HW_", "HWC"))
-        }
+        credential_vars = (
+            "HW_ACCESS_KEY", "HUAWEI_ACCESS_KEY", "HUAWEICLOUD_SDK_AK",
+            "HUAWEI_CLOUD_ACCESS_KEY", "HW_SECRET_KEY", "HUAWEI_SECRET_KEY",
+            "HUAWEICLOUD_SDK_SK", "HUAWEI_CLOUD_SECRET_KEY",
+        )
+        return {name: "" for name in credential_vars}
 
     def test_official_sdk_imports_resolve(self):
         # The exact import block of list_instances_via_sdk — every module
@@ -424,6 +430,17 @@ class TestSdkFallbackFix(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             list_instances_via_sdk("cn-north-4")
         self.assertEqual(getattr(self._captured_credentials, "ak", None), "alt-ak")
+
+    def test_sdk_fallback_ignores_non_whitelisted_env_vars(self):
+        # Credentials are read by explicit whitelist name only: a variable
+        # that merely *looks* like an AK/SK (e.g. MY_ACCESS_KEY) must never be
+        # harvested, even though it is the only AK present.
+        env = dict(self._clean_credential_env(),
+                   MY_ACCESS_KEY="bogus",
+                   TEAM_SECRET_KEY="bogus")
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ConfigError):
+                list_instances_via_sdk("cn-north-4")
 
 
 class TestFilterByStatus(unittest.TestCase):
@@ -609,6 +626,196 @@ class TestMain(unittest.TestCase):
         rc, out, err = self._run(["--status", "deleting-now"], [])
         self.assertEqual(rc, 1)
         self.assertIn("写操作意图", err)
+
+
+class TestMarkdownRender(unittest.TestCase):
+    def test_document_has_title_headers_separator_and_rows(self):
+        doc = render_markdown([INSTANCE_1, INSTANCE_2], "cn-north-4")
+        self.assertIn("# 华为云 RDS 实例列表", doc)
+        self.assertIn("cn-north-4", doc)
+        for label in ("实例 ID", "名称", "状态", "引擎", "版本", "规格",
+                      "私有 IP", "可用区", "区域", "创建时间"):
+            self.assertIn(label, doc)
+        lines = doc.splitlines()
+        header = next(i for i, line in enumerate(lines)
+                      if line.startswith("| 实例 ID |"))
+        self.assertTrue(lines[header + 1].startswith("| --- | --- |"))
+        row_lines = [line for line in lines[header + 2:] if line.startswith("| ")]
+        self.assertEqual(len(row_lines), 2)
+        for fragment in ("rds-0001", "rds-demo-01", "ACTIVE", "MySQL", "8.0",
+                         "rds.mysql.x1.large.2.ha", "192.168.0.10",
+                         "cn-north-4a", "rds-demo-02", "PostgreSQL"):
+            self.assertIn(fragment, doc)
+
+    def test_region_cell_falls_back_to_queried_region(self):
+        doc = render_markdown([{"id": "rds-x", "name": "rds-x"}], "cn-south-1")
+        self.assertIn("| rds-x | rds-x |", doc)
+        self.assertIn("| cn-south-1 |", doc)
+
+    def test_region_cell_uses_instance_value_when_present(self):
+        doc = render_markdown([dict(INSTANCE_1, region="cn-east-3")], "cn-north-4")
+        self.assertIn("| cn-east-3 |", doc)
+
+    def test_created_at_fallback_key(self):
+        doc = render_markdown([{"id": "rds-x", "created_at": "2026-01-02"}],
+                              "cn-north-4")
+        self.assertIn("2026-01-02", doc)
+
+    def test_cell_escapes_pipe_and_collapses_newlines(self):
+        instance = {"id": "rds|1", "name": "demo\n02", "status": "ACTIVE\r\nOK",
+                    "flavor_ref": {"a": "b|c"}}
+        doc = render_markdown([instance], "cn-north-4")
+        self.assertIn(r"rds\|1", doc)
+        self.assertIn("demo 02", doc)
+        self.assertIn("ACTIVE OK", doc)
+        self.assertIn(r'{"a":"b\|c"}', doc)
+
+    def test_empty_result_has_header_and_explicit_note(self):
+        doc = render_markdown([], "cn-south-1")
+        self.assertIn("| 实例 ID |", doc)
+        self.assertIn("| --- |", doc)
+        self.assertIn("无 RDS 实例", doc)
+        self.assertIn("cn-south-1", doc)
+        self.assertEqual(doc.count("| 实例 ID |"), 1)
+
+
+class TestMarkdownExportMain(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self._cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self._cwd)
+
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_rds.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            try:
+                rc = main(argv)
+            except SystemExit as exc:
+                rc = exc.code
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    @staticmethod
+    def _payload():
+        return (json.dumps({"instances": [INSTANCE_1, INSTANCE_2],
+                            "total_count": 2}), "", 0)
+
+    def test_format_md_writes_file(self):
+        out_path = os.path.join(self.tmpdir, "rds.md")
+        rc, out, err = self._run(["--format", "md", "--output", out_path],
+                                 [self._payload()])
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertIn("已生成 Markdown 文件", out)
+        self.assertIn(os.path.abspath(out_path), out)
+        with open(out_path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn("# 华为云 RDS 实例列表", content)
+        self.assertIn("| 实例 ID |", content)
+        self.assertIn("rds-demo-01", content)
+        self.assertIn("rds-demo-02", content)
+        self.assertEqual([n for n in os.listdir(self.tmpdir)
+                          if n.startswith(".rds-md-")], [])
+
+    def test_output_implies_md_format(self):
+        out_path = os.path.join(self.tmpdir, "implied.md")
+        rc, out, _ = self._run(["--output", out_path], [self._payload()])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(out_path))
+
+    def test_relative_output_creates_parent_directories(self):
+        os.chdir(self.tmpdir)
+        rc, out, _ = self._run(
+            ["--format", "md", "--output", "reports/2026/rds.md"],
+            [self._payload()])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.tmpdir, "reports", "2026", "rds.md")))
+        self.assertIn("reports/2026/rds.md", out)
+
+    def test_default_filename_uses_region_and_timestamp(self):
+        os.chdir(self.tmpdir)
+        rc, out, _ = self._run(
+            ["--format", "md", "--region", "cn-south-1"], [self._payload()])
+        self.assertEqual(rc, 0)
+        files = os.listdir(self.tmpdir)
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].startswith("rds_instances_cn-south-1_"))
+        self.assertTrue(files[0].endswith(".md"))
+
+    def test_empty_result_writes_table_and_note_exit_zero(self):
+        out_path = os.path.join(self.tmpdir, "empty.md")
+        rc, out, err = self._run(
+            ["--format", "md", "--output", out_path],
+            [(json.dumps({"instances": [], "total_count": 0}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertIn("无 RDS 实例", out)
+        with open(out_path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn("| 实例 ID |", content)
+        self.assertIn("无 RDS 实例", content)
+
+    def test_write_failure_reports_error_nonzero_and_no_partial_file(self):
+        out_path = os.path.join(self.tmpdir, "broken.md")
+        with mock.patch("list_rds.os.replace", side_effect=OSError("disk full")):
+            rc, out, err = self._run(
+                ["--format", "md", "--output", out_path], [self._payload()])
+        self.assertEqual(rc, 1)
+        self.assertIn("[错误]", err)
+        self.assertIn("Markdown 文件写出失败", err)
+        self.assertFalse(os.path.exists(out_path))
+        self.assertEqual([n for n in os.listdir(self.tmpdir)
+                          if n.startswith(".rds-md-")], [])
+
+    def test_uncreatable_parent_directory_reports_error(self):
+        blocker = os.path.join(self.tmpdir, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        out_path = os.path.join(blocker, "rds.md")
+        rc, out, err = self._run(
+            ["--format", "md", "--output", out_path], [self._payload()])
+        self.assertEqual(rc, 1)
+        self.assertIn("Markdown 文件写出失败", err)
+
+    def test_md_mutually_exclusive_with_json(self):
+        rc, out, err = self._run(["--format", "md", "--json"], [])
+        self.assertEqual(rc, 2)
+        self.assertIn("不能同时使用", err)
+
+    def test_output_mutually_exclusive_with_names_only(self):
+        rc, out, err = self._run(
+            ["--output", os.path.join(self.tmpdir, "x.md"), "--names-only"], [])
+        self.assertEqual(rc, 2)
+        self.assertIn("不能同时使用", err)
+
+    def test_explicit_table_format_matches_default_output(self):
+        rc, out, _ = self._run(["--format", "table"], [self._payload()])
+        self.assertEqual(rc, 0)
+        self.assertIn("RDS 实例列表（共 2 个，完整字段）", out)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmpdir, "rds_instances.md")))
+
+    def test_output_path_with_mutating_word_is_allowed(self):
+        out_path = os.path.join(self.tmpdir, "update-reports", "rds.md")
+        rc, out, err = self._run(["--output", out_path], [self._payload()])
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(os.path.isfile(out_path))
+
+    def test_write_markdown_is_atomic_on_success(self):
+        out_path = os.path.join(self.tmpdir, "atomic.md")
+        write_markdown("hello", out_path)
+        with open(out_path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "hello")
+        self.assertEqual([n for n in os.listdir(self.tmpdir)
+                          if n.startswith(".rds-md-")], [])
 
 
 class TestErrorHierarchy(unittest.TestCase):

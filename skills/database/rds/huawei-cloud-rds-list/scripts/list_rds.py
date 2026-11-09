@@ -15,6 +15,7 @@ Usage:
                                  [--status ACTIVE] [--name rds-01]
                                  [--datastore-type MySQL] [--page-size 100]
                                  [--operation ListInstances]
+                                 [--format table|md] [--output FILE]
 
 Environment overrides (mostly for tests):
     RDS_LIST_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -22,14 +23,17 @@ Environment overrides (mostly for tests):
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
+DEFAULT_OUTPUT_TEMPLATE = "rds_instances_%s_%s.md"
 SERVICE = "RDS"
 ALLOWED_OPERATION = "ListInstances"
 
@@ -90,7 +94,50 @@ PREFERRED_COLUMNS = [
     "charge_mode",
 ]
 
+# Markdown table columns: header label -> candidate source keys (first hit wins).
+MD_COLUMNS = (
+    ("实例 ID", ("id", "instance_id")),
+    ("名称", ("name", "instance_name")),
+    ("状态", ("status",)),
+    ("引擎", ("engine",)),
+    ("版本", ("engineVersion", "engine_version")),
+    ("规格", ("flavor_ref", "flavorRef")),
+    ("私有 IP", ("privateIps",)),
+    ("可用区", ("availability_zone",)),
+    ("区域", ("region",)),
+    ("创建时间", ("created", "created_at", "createdAt")),
+)
+
+# Values of these read-only flags are caller data (local output paths), not RDS
+# operations; they are removed before the write-intent scan to avoid false
+# positives (e.g. an output path containing a word like "delete").
+READ_ONLY_VALUE_FLAGS = frozenset(("--output", "-o"))
+
 _INSTANCE_LIST_KEYS = ("instances", "instance_list", "instanceInfos")
+
+# Whitelisted credential environment variables — read by explicit name only,
+# never by enumerating os.environ (avoids harvesting unrelated variables).
+_AK_ENV_NAMES = (
+    "HW_ACCESS_KEY",
+    "HUAWEI_ACCESS_KEY",
+    "HUAWEICLOUD_SDK_AK",
+    "HUAWEI_CLOUD_ACCESS_KEY",
+)
+_SK_ENV_NAMES = (
+    "HW_SECRET_KEY",
+    "HUAWEI_SECRET_KEY",
+    "HUAWEICLOUD_SDK_SK",
+    "HUAWEI_CLOUD_SECRET_KEY",
+)
+
+
+def _env_value(names):
+    """Read the first non-empty value from an explicit whitelist of env names."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
 
 _CREDENTIAL_MISSING_PATTERNS = (
     "cli-ak",
@@ -169,12 +216,36 @@ def guard_operation(operation):
     return True
 
 
+def scrub_read_only_values(argv):
+    """Drop the values of read-only flags before the write-intent scan.
+
+    A local ``--output`` path is caller data, not an RDS operation; scanning it
+    would cause false positives (e.g. ``reports/update-rds.md``). The flag itself
+    and every other token are kept and still scanned.
+    """
+    out = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            if not str(token).startswith("-"):
+                continue
+        out.append(token)
+        if token in READ_ONLY_VALUE_FLAGS:
+            skip_next = True
+        elif (str(token).startswith("-") and "=" in token
+              and token.split("=", 1)[0] in READ_ONLY_VALUE_FLAGS):
+            out.pop()
+    return " ".join(str(token) for token in out)
+
+
 def build_command(region, name=None, datastore_type=None,
                   instance_id=None, limit=DEFAULT_PAGE_SIZE, offset=0):
     """Build the hcloud RDS ListInstances argv (without the executable).
 
-    Mirrors the real KooCLI parameter list (`hcloud RDS ListInstances --help`):
-    --cli-region / --limit / --offset / --name / --datastore_type / --id.
+    Mirrors the real KooCLI parameter list for RDS ListInstances (verified
+    against the KooCLI help output): --cli-region / --limit / --offset /
+    --name / --datastore_type / --id.
     There is NO --status parameter on the server side — status filtering is
     applied client-side by `filter_by_status()` after the full list is fetched.
     """
@@ -312,10 +383,11 @@ def list_instances_via_sdk(region, name=None,
                            limit=DEFAULT_PAGE_SIZE, max_pages=100):
     """SDK fallback: query instances through `huaweicloudsdkrds` v3.
 
-    Only invoked when hcloud is not installed. Credentials are taken from the
-    standard environment variables (HUAWEI_*/HW_*/HWC_* AK/SK markers) — never
-    passed as literals here. The official SDK has no env-var auto-discovery on
-    `BasicCredentials()`, so AK/SK must be read explicitly. Region resolution
+    Only invoked when hcloud is not installed. Credentials are read by explicit
+    name from a fixed whitelist (HW_*/HUAWEI_ACCESS_KEY family) — never by
+    enumerating os.environ, and never passed as literals here. The official SDK
+    has no env-var auto-discovery on `BasicCredentials()`, so AK/SK must be
+    read explicitly. Region resolution
     uses the SDK's own `RdsRegion` catalog (official endpoints, no guessing),
     falling back to an explicit `Region(id, endpoint)` for custom regions.
     `ListInstancesRequest` has no `status` attribute (verified against the
@@ -335,21 +407,13 @@ def list_instances_via_sdk(region, name=None,
             "huaweicloudsdkrds。详情：%s" % exc
         )
 
-    def _env_credential(markers):
-        for key, value in os.environ.items():
-            upper = key.upper()
-            if not upper.startswith(("HUAWEI", "HW_", "HWC")):
-                continue
-            if any(marker in upper for marker in markers) and value:
-                return value
-        return None
-
-    ak = _env_credential(("ACCESS_KEY", "_AK"))
-    sk = _env_credential(("SECRET_KEY", "_SK"))
+    ak = _env_value(_AK_ENV_NAMES)
+    sk = _env_value(_SK_ENV_NAMES)
     if not ak or not sk:
         raise ConfigError(
             "SDK 回退缺少 AK/SK 凭证：官方 SDK 的 BasicCredentials 不会自动读取环境"
-            "变量，且当前环境未检测到 HUAWEI_*/HW_*/HWC_* 形式的 AK/SK 环境变量。"
+            "变量，且当前环境未检测到白名单中的 AK/SK 环境变量（HW_ACCESS_KEY /"
+            " HUAWEI_ACCESS_KEY / HUAWEICLOUD_SDK_AK 等）。"
             "请在会话外设置 HUAWEI_ACCESS_KEY / HUAWEI_SECRET_KEY（严禁在对话中粘贴"
             " AK/SK），参见 references/cli-installation-guide.md。"
         )
@@ -508,6 +572,84 @@ def render_table(instances):
     return "\n".join(lines)
 
 
+def _md_cell(value):
+    """Render one Markdown table cell, escaping pipes and collapsing newlines."""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = text.replace("|", "\\|")
+    return text or "-"
+
+
+def render_markdown(instances, region, generated_at=None):
+    """Render the instance list as a Markdown document (title + table).
+
+    Columns follow MD_COLUMNS (中文列头); every instance is normalized first so
+    nested ``datastore`` / ``private_ips`` / ``nodes`` fields render as flat
+    cells. The 区域 cell falls back to the queried region when the API response
+    carries no ``region`` field.
+
+    An empty instance list still produces a valid document: the table header +
+    separator followed by an explicit "no instances" note (never an error).
+    """
+    rows_data = [normalize_instance(instance) for instance in instances]
+    header = "| " + " | ".join(label for label, _ in MD_COLUMNS) + " |"
+    separator = "| " + " | ".join("---" for _ in MD_COLUMNS) + " |"
+    lines = [
+        "# 华为云 RDS 实例列表 — %s" % region,
+        "",
+        "> Region: %s | Instances: %d" % (region, len(rows_data)),
+    ]
+    if generated_at:
+        lines.append("> Generated at: %s" % generated_at)
+    lines += ["", header, separator]
+    for instance in rows_data:
+        cells = []
+        for _label, keys in MD_COLUMNS:
+            cells.append(_md_cell(_field(instance, *keys, default=region
+                                         if keys == ("region",) else "-")))
+        lines.append("| " + " | ".join(cells) + " |")
+    if not rows_data:
+        lines += ["", "_当前区域（%s）无 RDS 实例。_" % region]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def default_output_path(region, now=None):
+    """Default Markdown file name: rds_instances_<region>_<timestamp>.md."""
+    stamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime(
+        "%Y%m%dT%H%M%SZ")
+    return os.path.join(os.getcwd(), DEFAULT_OUTPUT_TEMPLATE % (region, stamp))
+
+
+def write_markdown(content, output_path):
+    """Write ``content`` to ``output_path`` atomically (temp file + rename).
+
+    Missing parent directories are created. An interrupted write never leaves a
+    corrupt / partial file behind.
+    """
+    directory = os.path.dirname(os.path.abspath(output_path))
+    try:
+        os.makedirs(directory, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".rds-md-", suffix=".tmp",
+                                            dir=directory)
+    except (OSError, ValueError) as exc:
+        raise ApiError("Markdown 文件写出失败（目录 %s 不可创建）：%s"
+                       % (directory, exc))
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, output_path)
+    except (OSError, ValueError) as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ApiError("Markdown 文件写出失败（%s）：%s" % (output_path, exc))
+    return output_path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="查询华为云 RDS 实例列表（KooCLI hcloud RDS ListInstances，只读）。")
@@ -529,11 +671,24 @@ def main(argv=None):
                         dest="page_size", help="分页大小（默认 %d）" % DEFAULT_PAGE_SIZE)
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
                         help="hcloud RDS 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+    parser.add_argument("--format", dest="export_format",
+                        choices=("table", "md"), default="table",
+                        help="输出格式：table（默认，终端表格）或 md"
+                             "（Markdown 文件，配合 --output）")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Markdown 输出文件路径（隐含 --format md；默认当前目录 "
+                             "rds_instances_<region>_<timestamp>.md）")
     args = parser.parse_args(argv)
 
+    if args.output:
+        args.export_format = "md"
+    if args.export_format == "md" and (args.as_json or args.names_only):
+        parser.error("--format md / --output 与 --json / --names-only 不能同时使用")
+
     try:
-        # Write-intent guard: scan the raw argv + validate the operation name.
-        guard_write_intent(" ".join(argv if argv is not None else sys.argv[1:]))
+        # Write-intent guard: scan the scrubbed raw argv + validate the operation.
+        raw_argv = argv if argv is not None else sys.argv[1:]
+        guard_write_intent(scrub_read_only_values(raw_argv))
         guard_operation(args.operation)
         if args.status:
             guard_write_intent(args.status)
@@ -559,6 +714,24 @@ def main(argv=None):
         print("Region %s 的 RDS 实例名称列表（共 %d 个）：" % (args.region, len(instances)))
         for name in instance_names(instances):
             print("- %s" % name)
+        return 0
+
+    if args.export_format == "md":
+        output_path = args.output or default_output_path(args.region)
+        generated_at = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        try:
+            content = render_markdown(instances, args.region, generated_at)
+            write_markdown(content, output_path)
+        except RdsListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        if instances:
+            print("已生成 Markdown 文件：%s（Region %s，共 %d 个 RDS 实例）。"
+                  % (os.path.abspath(output_path), args.region, len(instances)))
+        else:
+            print("已生成 Markdown 文件：%s（Region %s 无 RDS 实例，已输出表头与空表"
+                  "提示）。" % (os.path.abspath(output_path), args.region))
         return 0
 
     if not instances:

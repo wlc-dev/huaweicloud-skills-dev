@@ -5,9 +5,11 @@ description: |
      KooCLI (hcloud RDS ListInstances — read-only GET /v3/{project_id}/instances),
      with an automatic fallback to the official huaweicloudsdkrds v3 SDK when
      hcloud is not installed.
-  2. Three output modes: full-field table (default, every returned field including
-     名称/ID/状态/引擎/规格/私网IP/可用区), --json (raw response array), and
-     --names-only (compact instance-name list).
+  2. Four output modes: full-field table (default, every returned field including
+     名称/ID/状态/引擎/规格/私网IP/可用区), --json (raw response array),
+     --names-only (compact instance-name list), and optional Markdown export
+     (--format md / --output <path>, Chinese-column table written to a local .md
+     file for inventory/patrol/handover reports).
   3. Supports --status / --name / --datastore-type / --instance-id filtering,
      region override, and automatic offset paging. --name / --datastore-type /
      --instance-id are real ListInstances query parameters; --status is applied
@@ -23,7 +25,8 @@ description: |
      "查询RDS实例", "云数据库列表", "RDS inventory", "list cloud database instances",
      "华为云RDS列表".
   7. Offline unit tests (mocked hcloud subprocess) cover output modes, filters,
-     paging, error scenarios, SDK fallback, and the write-intent guard.
+     paging, error scenarios, SDK fallback, Markdown export, and the
+     write-intent guard.
 tags: [huawei-cloud, rds, database, readonly, koo-cli]
 ---
 
@@ -41,7 +44,8 @@ Architecture:
 
 ```text
 agent → python3 scripts/list_rds.py → hcloud RDS ListInstances --cli-region=<region>
-      → Huawei Cloud RDS OpenAPI (regional endpoint) → parsed JSON → table / --json / --names-only
+      → Huawei Cloud RDS OpenAPI (regional endpoint) → parsed JSON
+      → table / --json / --names-only / Markdown file (--format md / --output)
 
 (hcloud binary missing) → fallback: huaweicloudsdkrds v3 RdsClient.list_instances
 ```
@@ -59,9 +63,13 @@ Key properties:
 - **Full-field table output** — the default table renders the union of all
   fields returned by ListInstances, with `datastore` flattened into
   engine/engineVersion and `private_ips` joined for readability.
+- **Optional Markdown export** — `--format md` (or `--output <path>`, which
+  implies md) writes a valid Markdown table (Chinese headers + separator +
+  rows) to a local file, atomically (temp file + `os.replace`). Omitting the
+  export flags keeps the existing terminal output byte-for-byte unchanged.
 - **Offline-testable** — every code path (paging, filters, error
-  classification, guard, SDK fallback) is covered by unit tests that mock the
-  hcloud subprocess.
+  classification, guard, SDK fallback, Markdown render/write) is covered by
+  unit tests that mock the hcloud subprocess.
 
 Out of scope: every mutating RDS action (create / delete / resize / restart /
 stop / restore backup / change password / read-replica management). Those
@@ -89,9 +97,11 @@ require a dedicated write-capable skill and explicit user confirmation.
 2. **Confirm hcloud readiness** (optional, read-only): `hcloud configure list`.
 3. **Run the list script** with the desired output mode and filters.
 4. **Read the result** — table for humans, `--json` for downstream tooling,
-   `--names-only` for a compact inventory.
+   `--names-only` for a compact inventory, `--format md` / `--output` for a
+   Markdown report file (inventory / patrol / handover).
 5. **Handle the empty / error cases** per the Edge Cases table below (the
-   script prints an explicit hint for empty region, 403, and missing AK/SK).
+   script prints an explicit hint for empty region, 403, missing AK/SK, and
+   Markdown write failures).
 
 ## Core Commands
 
@@ -114,7 +124,25 @@ python3 scripts/list_rds.py --datastore-type MySQL --name rds-demo
 
 # Combine filters
 python3 scripts/list_rds.py --region cn-south-1 --status ACTIVE --names-only
+
+# Export to Markdown (explicit file path; parent directories auto-created)
+python3 scripts/list_rds.py --format md --output reports/rds-cn-north-4.md
+
+# --output alone implies --format md; omitting it uses
+# rds_instances_<region>_<timestamp>.md in the current directory
+python3 scripts/list_rds.py --output reports/rds.md
+python3 scripts/list_rds.py --format md
+
+# Markdown + filters (empty result still writes header + 「无实例」note, exit 0)
+python3 scripts/list_rds.py --format md --status ACTIVE --output reports/active.md
 ```
+
+Markdown file layout: a title (`# 华为云 RDS 实例列表 — <region>`), a metadata
+line, then a Chinese-header table (`实例 ID / 名称 / 状态 / 引擎 / 版本 / 规格 /
+私有 IP / 可用区 / 区域 / 创建时间`) with a `---` separator and one row per
+instance. `|` in a cell is escaped as `\|` and newlines are collapsed to spaces.
+Writes are atomic (temp file + `os.replace`), so a failed write never leaves a
+half-written file.
 
 Equivalent direct KooCLI command (the script wraps exactly this call, with
 paging):
@@ -136,8 +164,12 @@ hcloud RDS ListInstances --cli-region=cn-north-4 --limit=100 --offset=0
 | `--instance-id` | No | Filter by exact instance ID | `rds-0001` |
 | `--page-size` | No | Page size for ListInstances (default 100) | `100` |
 | `--operation` | No | hcloud RDS operation name; only `ListInstances` is allowed | `ListInstances` |
+| `--format` | No | Output format: `table` (default, terminal table) or `md` (Markdown file) | `md` |
+| `--output` / `-o` | No | Markdown file path; **implies `--format md`**. Relative/absolute paths accepted, parent directories auto-created. Default file name `rds_instances_<region>_<timestamp>.md` in the current directory | `reports/rds.md` |
 
-Output-mode precedence: `--names-only` → `--json` → table (default).
+Output-mode precedence: `--names-only` → `--json` → `--format md` → table
+(default). `--format md` / `--output` are **mutually exclusive** with `--json` /
+`--names-only` (exit code 2 with an explicit message).
 
 ## Write-Intent Guard
 
@@ -182,8 +214,11 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 | Network / API failure | Exit 1 with the hcloud stderr excerpt |
 | KooCLI usage error (`[USE_ERROR] ...`, even with exit code 0) | Exit 1, explicit `hcloud 参数错误` hint pointing to `hcloud RDS ListInstances --help` |
 | Write intent detected | Exit 1, `GuardError` message, no command executed |
+| Markdown write failure (uncreatable directory / I/O error) | Exit 1, `[错误] Markdown 文件写出失败（...）` on stderr; no partial file left behind |
+| `--format md` / `--output` combined with `--json` / `--names-only` | Exit 2, explicit "不能同时使用" message, no query executed |
 
-Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
+Exit codes: `0` success / empty region / empty Markdown export; `1` config,
+auth, guard, API, or Markdown write error; `2` mutually exclusive arguments.
 
 ## Edge Cases
 
@@ -197,6 +232,10 @@ Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
 | Nested `datastore` / `nodes` / `private_ips` | Flattened into engine / engineVersion / availability_zone / privateIps for the table |
 | Non-JSON hcloud output | `ApiError` with the raw excerpt (first 200 chars) |
 | hcloud absent, SDK installed | Transparent fallback to `huaweicloudsdkrds` list_instances, same output modes |
+| Empty result with `--format md` | Still writes title + header + separator + explicit `_当前区域（<x>）无 RDS 实例。_` note, exit 0 |
+| Markdown cell contains `|` / newline | Pipe escaped as `\|`, newlines collapsed to spaces (table stays valid) |
+| `--output` points at a nested / relative path | Parent directories created automatically; atomic temp-file write |
+| `--output` path contains mutating words | Local path values are excluded from the write-intent scan (no false positive) |
 | User asks to create/delete/resize | Out of scope — blocked by the write-intent guard; a write-capable skill with explicit user confirmation is required |
 
 ## Testing
@@ -215,8 +254,11 @@ client-side status filtering (exact / case-insensitive / no-match / missing
 field), paging (total / full-page / empty), SDK fallback (success and
 unavailable; request construction matches the real `ListInstancesRequest`
 signature — `status=` must raise TypeError), rendering (table with
-engine/flavor/private IP fields / names / fallbacks), and all main() output
-modes including empty, filter, and error paths.
+engine/flavor/private IP fields / names / fallbacks), Markdown export
+(render columns/escaping/empty note, explicit and default file names,
+relative paths + parent-dir creation, atomic write, write-failure cleanup,
+mutual exclusivity), and all main() output modes including empty, filter, and
+error paths.
 
 ## Reference Documents
 
