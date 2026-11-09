@@ -46,7 +46,7 @@ automatically.
 
 ```bash
 hcloud DNS ListPublicZones --cli-region=cn-north-4 --limit=100
-hcloud DNS ListPrivateZones --cli-region=cn-north-4 --limit=100
+hcloud DNS ListPrivateZones --cli-region=cn-north-4 --type=private --limit=100
 hcloud DNS ListRecordSets --cli-region=cn-north-4 --zone_type=public --limit=100
 ```
 

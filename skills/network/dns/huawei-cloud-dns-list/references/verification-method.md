@@ -14,8 +14,12 @@ python3 -m unittest discover -s tests -v
   `ListPrivateZonesRequest` / `ListRecordSetsRequest` and `DnsRegion` when
   `huaweicloudsdkdns` is installed (skipped otherwise).
 - Cases cover: write-intent guard, operation resolution, command construction
-  (filters forwarded server-side), JSON extraction, failure classification
-  (missing AK/SK / 403 / generic / `[USE_ERROR]` with rc=0), marker paging
+  (filters forwarded server-side), JSON extraction (including trailing
+  diagnostics after a JSON body via `raw_decode`), failure classification
+  (missing AK/SK / 403 / `DNS.1802` / `not authorized` /
+  `no identity-based policy` / generic / `[USE_ERROR]` with rc=0), API error
+  envelopes returned with rc=0 (never an empty list; `--output` creates no
+  file), marker paging
   (last-id + `total_count` / empty page), SDK fallback (public zones / private
   zones / record sets / missing credentials / missing project id / unavailable),
   rendering, and all main() output modes.
@@ -48,7 +52,10 @@ endpoint or parameter was inferred from naming patterns:
 - `ListPublicZonesRequest` / `ListPrivateZonesRequest` real query parameters:
   `type`, `limit` (0–500), `marker`, `offset`, `tags`, `name`, `id`, `status`,
   `search_mode`, `sort_key`, `sort_dir`, `enterprise_project_id`
-  (`ListPrivateZonesRequest` additionally accepts `router_id`).
+  (`ListPrivateZonesRequest` additionally accepts `router_id`). `hcloud DNS
+  ListPrivateZones --help` marks `type` as **required** (range: `private`) —
+  the script therefore always sends `--type=private` for `ListPrivateZones`;
+  `ListPublicZones` has no required `type` parameter.
 - `ListRecordSetsRequest` real query parameters: `zone_type` (public/private),
   `marker`, `search_mode`, `limit` (0–500), `offset`, `tags`, `status`, `type`
   (record type), `name`, `id`, `records`, `sort_key`, `sort_dir`.

@@ -12,7 +12,13 @@ credential profile / environment. Supports three output modes
 (table / --json / --names-only), --type / --id / --name filters (all real
 server-side query parameters), marker-based paging, and a strict write-intent
 guard: any argument that looks like a mutating DNS operation is rejected before
-a single command is executed.
+a single command is executed. API error bodies printed on stdout with exit code
+0 (``errCode`` / ``externalMessage``, ``error_code`` / ``error_msg``,
+``code`` / ``message``, nested ``error`` — e.g. ``DNS.1802``) are classified as
+explicit failures, never as an empty list. ``--output`` / ``-o [FILE]``
+additionally writes the current table view to a UTF-8 Markdown file (default
+`dns_zones.md` for zones, `dns_recordsets.md` for record sets) without changing
+the stdout modes.
 
 Usage:
     python3 scripts/list_dns.py [--region cn-north-4]
@@ -21,6 +27,7 @@ Usage:
                                 [--id <zone-id>] [--name <domain>]
                                 [--record-type A] [--page-size 100]
                                 [--project-id <id>] [--operation ListPublicZones]
+                                [--output [FILE]]
 
 Environment overrides (mostly for tests):
     DNS_LIST_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -33,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
@@ -103,30 +111,22 @@ WRITE_INTENT_KEYWORDS = (
     "disabling",
 )
 
-# Preferred column order for the table view; remaining keys are appended sorted.
-PREFERRED_COLUMNS = [
-    "id",
-    "name",
-    "zone_type",
-    "type",
-    "status",
-    "record_num",
-    "records",
-    "ttl",
-    "zone_id",
-    "zone_name",
-    "email",
-    "serial",
-    "pool_id",
-    "description",
-    "enterprise_project_id",
-    "project_id",
-    "default",
-    "create_at",
-    "created_at",
-    "update_at",
-    "updated_at",
-]
+# Views share one column-union builder so the terminal table and the Markdown
+# export never drift apart. Preferred columns come first; every other returned
+# field is appended in sorted order.
+VIEW_ZONES = "zones"
+VIEW_RECORD_SETS = "recordsets"
+
+VIEW_PREFERRED_COLUMNS = {
+    VIEW_ZONES: ["name", "zone_type", "status", "record_num", "email", "ttl"],
+    VIEW_RECORD_SETS: ["name", "type", "ttl", "records", "zone_name"],
+}
+
+# Default Markdown file names per view (used by ``-o`` without a value).
+DEFAULT_OUTPUT_FILES = {
+    VIEW_ZONES: "dns_zones.md",
+    VIEW_RECORD_SETS: "dns_recordsets.md",
+}
 
 _ITEM_LIST_KEYS = ("zones", "recordsets", "record_sets", "recordSets")
 
@@ -150,6 +150,9 @@ _AUTH_PATTERNS = (
     "unauthorized",
     "forbidden",
     "apigw.0301",
+    "not authorized",
+    "no identity-based policy",
+    "dns.1802",
     "认证失败",
     "权限不足",
     "permission denied",
@@ -199,6 +202,35 @@ def guard_write_intent(text):
     return False
 
 
+def _strip_output_value(raw_argv):
+    """Drop the ``--output`` / ``-o`` value before the write-intent scan.
+
+    The output path is caller data, not an operation intent, so a path such as
+    ``./delete-report.md`` must not trip the guard. All four supported forms
+    are handled: ``-o`` (no value), ``-o PATH``, ``--output PATH`` and
+    ``--output=PATH``. A following token that starts with ``-`` is a flag, not
+    the optional value (argparse ``nargs="?"`` semantics), so it is kept.
+    """
+    result = []
+    skip_value = False
+    for arg in raw_argv:
+        if skip_value:
+            skip_value = False
+            if not arg.startswith("-"):
+                continue
+            result.append(arg)
+            continue
+        if arg in ("--output", "-o"):
+            skip_value = True
+            continue
+        if arg.startswith("--output="):
+            continue
+        if arg.startswith("-o") and not arg.startswith("--") and len(arg) > 2:
+            continue
+        result.append(arg)
+    return result
+
+
 def guard_operation(operation):
     """Only the read-only list operations may be executed."""
     if operation not in ALLOWED_OPERATIONS:
@@ -225,10 +257,11 @@ def build_command(region, operation, zone_type="public", item_id=None,
 
     Mirrors the real KooCLI parameter list for the read-only DNS list
     operations: --cli-region / --limit / --marker plus the real server-side
-    filters. Zone listings use the operation's implicit type
-    (ListPublicZones → public, ListPrivateZones → private); record-set
-    listings take --zone_type (public/private) and an optional --type
-    (record type, e.g. A/AAAA/CNAME).
+    filters. ListPrivateZones declares ``--type`` as a **required** parameter
+    (range: private), so ``--type=private`` is always appended for it —
+    ListPublicZones has no such required parameter and keeps the service
+    default. Record-set listings take --zone_type (public/private) and an
+    optional --type (record type, e.g. A/AAAA/CNAME).
     """
     argv = [
         SERVICE,
@@ -242,7 +275,12 @@ def build_command(region, operation, zone_type="public", item_id=None,
         argv.append("--id=%s" % item_id)
     if name:
         argv.append("--name=%s" % name)
-    if operation == OP_LIST_RECORD_SETS:
+    if operation == OP_LIST_PRIVATE_ZONES:
+        # `hcloud DNS ListPrivateZones --help` marks `--type` as required
+        # (range: private). Without it KooCLI fails with
+        # `[USE_ERROR] The following parameters are required: type`.
+        argv.append("--type=private")
+    elif operation == OP_LIST_RECORD_SETS:
         argv.append("--zone_type=%s" % zone_type)
         if record_type:
             argv.append("--type=%s" % record_type)
@@ -276,20 +314,61 @@ def run_hcloud(argv):
 
 
 def extract_json(stdout):
-    """Parse hcloud stdout as JSON; tolerate wrapper/noise lines."""
+    """Parse hcloud stdout as JSON, tolerating trailing diagnostic text.
+
+    KooCLI may append diagnostics after the JSON body, so when a plain
+    ``json.loads`` fails the first complete JSON value is decoded starting at
+    the first ``{`` via ``raw_decode`` instead of slicing through the last
+    ``}`` (which trailing text would break).
+    """
     text = stdout.strip()
     if not text:
         return {}
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
+        payload = None
+        start = text.find("{")
+        if start >= 0:
             try:
-                return json.loads(text[start:end + 1])
+                payload, _end = json.JSONDecoder().raw_decode(text, start)
             except json.JSONDecodeError:
-                pass
-        raise ApiError("hcloud 输出无法解析为 JSON：%s" % text[:200])
+                payload = None
+        if payload is None:
+            raise ApiError("hcloud 输出无法解析为 JSON：%s" % text[:200])
+        return payload
+
+
+def _payload_error(payload):
+    """Return the error text when a payload is a DNS/KooCLI error envelope.
+
+    KooCLI returns HTTP-level API errors on stdout with exit code 0, e.g.
+    ``{"errCode": "DNS.1802", "externalMessage": "..."}`` or
+    ``{"code": "DNS.1802", "message": "..."}``. Such an envelope must surface
+    as an explicit error, never as an empty zone / record-set list.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for code_key, msg_key in (
+        ("errCode", "externalMessage"),
+        ("error_code", "error_msg"),
+        ("errorCode", "errorMsg"),
+        ("code", "message"),
+    ):
+        code = payload.get(code_key)
+        if code:
+            msg = payload.get(msg_key) or ""
+            return ("%s %s" % (code, msg)).strip()
+    err = payload.get("error")
+    if isinstance(err, dict):
+        code = err.get("error_code") or err.get("code") or err.get("errCode") or ""
+        msg = (err.get("error_msg") or err.get("message")
+               or err.get("externalMessage") or "")
+        text = ("%s %s" % (code, msg)).strip()
+        return text or None
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    return None
 
 
 def classify_hcloud_failure(stdout, stderr, returncode):
@@ -311,7 +390,8 @@ def classify_hcloud_failure(stdout, stderr, returncode):
         )
     if any(p in low for p in _AUTH_PATTERNS):
         return AuthError(
-            "无权限访问云解析服务（DNS），请检查 IAM 权限（403：AK/SK 无效或未授予 DNS 只读权限），"
+            "无权限访问云解析服务（DNS），请检查 IAM 权限（DNS.1802 / 403："
+            "AK/SK 无效、未授予 DNS 只读权限或身份策略不允许该操作），"
             "参见 references/iam-policies.md。详情：%s" % blob[:300]
         )
     return ApiError(
@@ -556,6 +636,9 @@ def list_dns(region, operation, zone_type="public", item_id=None, name=None,
             # KooCLI usage errors print [USE_ERROR] on stdout with rc=0.
             raise classify_hcloud_failure(stdout, stderr, returncode)
         payload = extract_json(stdout)
+        err_text = _payload_error(payload)
+        if err_text:
+            raise classify_hcloud_failure("", err_text, returncode)
         batch = extract_items(payload)
         items.extend(batch)
         total = _total_count(payload)
@@ -595,18 +678,28 @@ def _cell(value):
     return str(value)
 
 
-def render_table(items):
-    """Render full-field table output (union of all returned fields)."""
+def _table_columns(items, view=VIEW_ZONES):
+    """Build the column list shared by the terminal table and Markdown export.
+
+    Preferred columns for the view come first (only if any item carries them),
+    then every other returned field in sorted order. An empty result falls back
+    to the view's preferred columns so a header-only table is still emitted.
+    """
+    preferred = VIEW_PREFERRED_COLUMNS.get(view, VIEW_PREFERRED_COLUMNS[VIEW_ZONES])
     rows_data = [dict(item) for item in items]
-    columns = []
-    for key in PREFERRED_COLUMNS:
-        if any(key in row for row in rows_data):
-            columns.append(key)
+    columns = [key for key in preferred if any(key in row for row in rows_data)]
     for key in sorted({k for row in rows_data for k in row}):
         if key not in columns:
             columns.append(key)
     if not columns:
-        columns = ["id", "name"]
+        columns = list(preferred)
+    return columns
+
+
+def render_table(items, view=VIEW_ZONES):
+    """Render full-field table output (union of all returned fields)."""
+    rows_data = [dict(item) for item in items]
+    columns = _table_columns(items, view)
     rows = [[_cell(_field(row, col)) for col in columns] for row in rows_data]
     widths = [max(len(col), *(len(row[i]) for row in rows))
               for i, col in enumerate(columns)]
@@ -617,6 +710,80 @@ def render_table(items):
         lines.append("  ".join(row[i].ljust(widths[i])
                                for i in range(len(columns))))
     return "\n".join(lines)
+
+
+def _md_escape(text):
+    """Escape a cell for a Markdown table (pipe + line breaks)."""
+    escaped = str(text).replace("|", "\\|")
+    return (escaped.replace("\r\n", "<br>")
+            .replace("\n", "<br>")
+            .replace("\r", "<br>"))
+
+
+def render_markdown(items, columns):
+    """Render ``items`` as a GitHub-flavoured Markdown table.
+
+    Missing fields render as ``-`` and nested ``tags`` / ``links`` as compact
+    JSON (both via ``_field`` / ``_cell``); pipes and newlines are escaped so
+    the table stays valid. An empty ``items`` list still yields a header-only
+    table.
+    """
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join("---" for _ in columns) + " |"
+    lines = [header, separator]
+    for item in items:
+        row = [_md_escape(_cell(_field(item, col))) for col in columns]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def write_markdown(path, text):
+    """Write ``text`` to ``path`` atomically as UTF-8 (temp file + rename).
+
+    The parent directory must already exist and be writable; otherwise an
+    ``ApiError`` is raised and no partial / temporary file is left behind.
+    """
+    target = os.path.abspath(path)
+    directory = os.path.dirname(target) or "."
+    if not os.path.isdir(directory):
+        raise ApiError(
+            "Markdown 文件写出失败（目录不存在：%s）" % directory)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix=".dns-md-", suffix=".tmp", delete=False) as handle:
+            tmp_path = handle.name
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        tmp_path = None
+    except OSError as exc:
+        raise ApiError("Markdown 文件写出失败（%s）：%s" % (path, exc))
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return target
+
+
+def resolve_output_path(value, view=VIEW_ZONES):
+    """Resolve ``--output`` into a path (``None`` when export is disabled).
+
+    ``value is True`` means the flag was given without a value (argparse
+    ``nargs="?"`` const), so the view's default file name under the current
+    directory is used.
+    """
+    if value is None:
+        return None
+    if value is True or value == "":
+        default_name = DEFAULT_OUTPUT_FILES.get(
+            view, DEFAULT_OUTPUT_FILES[VIEW_ZONES])
+        return os.path.join(os.getcwd(), default_name)
+    return str(value)
 
 
 def _zone_type_label(zone_type):
@@ -651,13 +818,19 @@ def main(argv=None):
     parser.add_argument("--operation", default=None,
                         help="hcloud DNS 操作名（仅允许只读 %s）"
                              % " / ".join(ALLOWED_OPERATIONS))
+    parser.add_argument("-o", "--output", nargs="?", const=True, default=None,
+                        metavar="FILE",
+                        help="导出当前表格视图为 Markdown 文件并打印绝对路径；"
+                             "仅传 -o 时 zone 视图默认 dns_zones.md、记录集视图"
+                             "默认 dns_recordsets.md")
     args = parser.parse_args(argv)
 
     raw_argv = argv if argv is not None else sys.argv[1:]
 
     try:
-        # Write-intent guard: scan the raw argv + validate the operation name.
-        guard_write_intent(" ".join(raw_argv))
+        # Write-intent guard: scan the raw argv (minus the --output value) +
+        # validate the operation name.
+        guard_write_intent(" ".join(_strip_output_value(raw_argv)))
         operation = args.operation or resolve_operation(args.type, args.recordsets)
         guard_operation(operation)
         items = list_dns(
@@ -675,7 +848,11 @@ def main(argv=None):
         return 1
 
     is_record_sets = operation == OP_LIST_RECORD_SETS
-    subject = "DNS 记录集" if is_record_sets else "DNS %s域名" % _zone_type_label(args.type)
+    view = VIEW_RECORD_SETS if is_record_sets else VIEW_ZONES
+    zone_type = "private" if operation == OP_LIST_PRIVATE_ZONES else "public"
+    subject = ("DNS 记录集" if is_record_sets
+               else "DNS %s域名" % _zone_type_label(zone_type))
+    columns = _table_columns(items, view)
 
     if args.as_json:
         print(json.dumps(items, ensure_ascii=False, indent=2))
@@ -687,6 +864,15 @@ def main(argv=None):
         for name in item_names(items):
             print("- %s" % name)
         return 0
+
+    output_path = resolve_output_path(args.output, view)
+    if output_path is not None:
+        try:
+            write_markdown(output_path, render_markdown(items, columns))
+        except DnsListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        print(os.path.abspath(output_path))
 
     if not items:
         filters = []
@@ -702,7 +888,7 @@ def main(argv=None):
 
     print("Region %s 的 %s列表（共 %d 个，完整字段）："
           % (args.region, subject, len(items)))
-    print(render_table(items))
+    print(render_table(items, view))
     return 0
 
 
