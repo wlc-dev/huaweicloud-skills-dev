@@ -1,0 +1,56 @@
+{
+  "skill_name": "huawei-cloud-css-cluster-list",
+  "region": "cn-north-4",
+  "test_cases": [
+    {
+      "id": "TC-01",
+      "name": "ListClustersDetails 操作与参数（语法）",
+      "command": "hcloud CSS ListClustersDetails --cli-region={region} --help",
+      "expected": "KooCLI prints the ListClustersDetails help (GET; query params offset/limit/datastoreType)",
+      "type": "syntax",
+      "executor": "cli"
+    },
+    {
+      "id": "TC-02",
+      "name": "ShowClusterDetail 操作与参数（语法）",
+      "command": "hcloud CSS ShowClusterDetail --cli-region={region} --help",
+      "expected": "KooCLI prints the ShowClusterDetail help (GET; required --cluster_id)",
+      "type": "syntax",
+      "executor": "cli"
+    },
+    {
+      "id": "TC-03",
+      "name": "ShowClusterVolumeUsage 操作与参数（语法）",
+      "command": "hcloud CSS ShowClusterVolumeUsage --cli-region={region} --help",
+      "expected": "KooCLI prints the ShowClusterVolumeUsage help (GET; required --cluster_id)",
+      "type": "syntax",
+      "executor": "cli"
+    },
+    {
+      "id": "TC-04",
+      "name": "集群列表真实只读调用（live，单页）",
+      "command": "hcloud CSS ListClustersDetails --cli-region={region} --limit=1 --offset=1",
+      "expected": "Returns the cluster list JSON ({clusters, totalSize}) or an explicit CSS.0051/403 envelope (KooCLI exit 0)",
+      "type": "readonly",
+      "executor": "cli"
+    },
+    {
+      "id": "TC-05",
+      "name": "脚本参数帮助",
+      "command": "python3 scripts/list_css_clusters.py --help",
+      "expected": "argparse help printed, exit 0",
+      "type": "syntax",
+      "executor": "script"
+    },
+    {
+      "id": "TC-06",
+      "name": "离线单元测试",
+      "command": "python3 -m unittest discover -s tests",
+      "expected": "All offline unit tests pass (mocked hcloud + fake SDK): guard / commands / parsing / paging / filters / normalize / render / SDK fallback / main modes",
+      "type": "unit",
+      "executor": "script"
+    }
+  ],
+  "env_vars_required": ["以 HUAWEI/HW/HWC/CLOUD_SDK 开头的环境变量中匹配 AK/SK 的键值对"],
+  "notes": "只读操作（CSS ListClustersDetails / ShowClusterDetail / ShowClusterVolumeUsage，均为 GET），无创建/删除/重启/扩容/快照等写风险。CLI 主路径使用 hcloud CSS（经 skill-quality-cli 包裹）；SDK 回退使用 huaweicloudsdkcss v1（BasicCredentials），SDK 缺失时运行 scripts/ensure_env.py。写意图守卫拦截变更意图，其行为由离线单元测试覆盖。真实只读成功路径需要 IAM 授予 css:cluster:list / css:cluster:get；当前账号策略未授予时脚本返回明确的 403/CSS.0051 提示（rc=1）。"
+}
