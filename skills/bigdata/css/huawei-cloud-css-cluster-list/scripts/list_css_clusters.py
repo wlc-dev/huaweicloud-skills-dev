@@ -25,11 +25,16 @@ and a write-intent guard rejects mutating intent before any command runs.
 Usage:
     python3 scripts/list_css_clusters.py [--region cn-north-4]
                                          [--json | --table]
+                                         [--output [FILE]]
                                          [--name NAME [--fuzzy]]
                                          [--cluster-id CLUSTER_ID]
                                          [--status 200|100|303|abnormal]
                                          [--datastore-type elasticsearch]
                                          [--limit 10]
+
+    ``--output`` / ``-o`` additionally writes the table view to a local
+    Markdown file (default ``css_clusters.md`` in the current directory) and
+    prints the absolute path.
 
 Environment overrides (mostly for tests):
     CSS_LIST_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -39,12 +44,14 @@ Environment overrides (mostly for tests):
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 # Never emit __pycache__/*.pyc into the shipped skill directory.
 sys.dont_write_bytecode = True
@@ -53,6 +60,7 @@ DEFAULT_REGION = "cn-north-4"
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 100
 DEFAULT_MAX_PAGES = 200
+DEFAULT_OUTPUT = "css_clusters.md"
 
 SERVICE = "CSS"
 LIST_OPERATION = "ListClustersDetails"
@@ -149,6 +157,9 @@ _VALUE_STRIPPED_FLAGS = (
     "--offset",
     "--max-pages",
     "--page-size",
+    # Local output path is caller data, not an operation intent.
+    "--output",
+    "-o",
 )
 
 # AK/SK environment variable names, read directly (never by enumerating
@@ -1196,6 +1207,240 @@ def render_simple_view(region, raw_clusters, filters=None):
 
 
 # ---------------------------------------------------------------------------
+# Markdown export
+# ---------------------------------------------------------------------------
+
+def _md_cell(value):
+    """Render one Markdown table cell, escaping pipes and collapsing newlines."""
+    if value is None:
+        return _FIELD_MISSING
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = str(value)
+    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    text = text.replace("|", "\\|")
+    return text or _FIELD_MISSING
+
+
+def _md_table(headers, rows):
+    """Render a GitHub-flavoured Markdown table (header + separator + rows)."""
+    header = "| " + " | ".join(_md_cell(label) for label in headers) + " |"
+    separator = "| " + " | ".join("---" for _ in headers) + " |"
+    lines = [header, separator]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+    return "\n".join(lines)
+
+
+def _filter_text(filters):
+    """Render the active filters as ``过滤条件: k=v, ...`` (or 无过滤条件)."""
+    if not filters:
+        return "无过滤条件"
+    if isinstance(filters, dict):
+        filters = ["%s=%s" % (k, v) for k, v in filters.items() if v]
+    filters = [str(item) for item in filters if item]
+    if not filters:
+        return "无过滤条件"
+    return "过滤条件: %s" % ", ".join(filters)
+
+
+def _normalized_cluster_rows(raw_clusters, region, usage_lookup=None):
+    usage_lookup = usage_lookup or {}
+    normalized = []
+    for record in raw_clusters:
+        cluster = normalize_cluster(
+            record, region=region,
+            usage_percent=usage_lookup.get(str(_field(record, "id", default=""))))
+        normalized.append(cluster)
+    return normalized
+
+
+def render_markdown_cluster_view(region, raw_clusters, usage_lookup=None,
+                                 filters=None, generated_at=None):
+    """Render the cluster view (same fields as --table) as a Markdown document.
+
+    The abnormal-cluster and capacity (disk usage >= 80%) sections mirror the
+    terminal ``--table`` view, keeping them separated from the normal rows.
+    An empty result still produces a valid document with the table header.
+    """
+    normalized = _normalized_cluster_rows(raw_clusters, region, usage_lookup)
+    normals = [c for c in normalized if not c["abnormal"]]
+    abnormals = [c for c in normalized if c["abnormal"]]
+    capacity = [c for c in normalized if c["capacity_alert"]]
+
+    lines = [
+        "# Huawei Cloud CSS 集群列表 — %s" % region,
+        "",
+        "> Region: %s | 集群数: %d | %s"
+        % (region, len(normalized), _filter_text(filters)),
+    ]
+    if generated_at:
+        lines.append("> Generated at: %s" % generated_at)
+    lines += [
+        "",
+        "## 集群列表（共 %d 个，正常 %d / 异常 %d）"
+        % (len(normalized), len(normals), len(abnormals)),
+        "",
+        _md_table(CLUSTER_HEADERS, [_cluster_row(c) for c in normals]),
+    ]
+    if not normalized:
+        lines += ["", "_当前区域（%s）无 CSS 集群%s。_"
+                  % (region, "（%s）" % _filter_text(filters)
+                     if filters else "")]
+    if abnormals:
+        lines += [
+            "",
+            "## ⚠ 异常状态集群（共 %d 个，已与正常集群分开列出，请优先排查）"
+            % len(abnormals),
+            "",
+            _md_table(CLUSTER_HEADERS, [_cluster_row(c) for c in abnormals]),
+        ]
+    if capacity:
+        lines += [
+            "",
+            "## ⚠ 容量使用率 ≥80%% 的集群（共 %d 个，需尽快扩容或清理）"
+            % len(capacity),
+            "",
+            _md_table(["名称", "集群ID", "磁盘使用率"],
+                      [[c["name"], c["id"],
+                        _usage_text(c.get("usage_percent"), True)]
+                       for c in capacity]),
+        ]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_markdown_node_view(region, detail, disk_infos, generated_at=None):
+    """Render the per-cluster node view (same fields as --table) as Markdown."""
+    name = _field(detail, "name", default=_FIELD_MISSING)
+    cluster_id = _field(detail, "id", default=_FIELD_MISSING)
+    instances = _field(detail, "instances", default=[])
+    if not isinstance(instances, list):
+        instances = []
+    usage_by_id = {}
+    usage_by_name = {}
+    for info in disk_infos or []:
+        if not isinstance(info, dict):
+            continue
+        key = str(_field(info, "id", default=""))
+        if key:
+            usage_by_id[key] = info
+        node_name = str(_field(info, "name", default=""))
+        if node_name:
+            usage_by_name[node_name] = info
+    nodes = []
+    for instance in instances:
+        key = str(_field(instance, "id", default=""))
+        node_name = str(_field(instance, "name", default=""))
+        usage = usage_by_id.get(key) or usage_by_name.get(node_name)
+        nodes.append(normalize_node(instance, region=region, usage=usage))
+    normals = [n for n in nodes if not n["abnormal"]]
+    abnormals = [n for n in nodes if n["abnormal"]]
+    high_usage = [n for n in nodes
+                  if n["usage_percent"] is not None
+                  and n["usage_percent"] >= CAPACITY_ALERT_PERCENT]
+
+    lines = [
+        "# Huawei Cloud CSS 节点列表 — %s" % cluster_id,
+        "",
+        "> 集群: %s (%s) | Region: %s | 节点数: %d"
+        % (name, cluster_id, region, len(nodes)),
+    ]
+    if generated_at:
+        lines.append("> Generated at: %s" % generated_at)
+    lines += [
+        "",
+        "## 节点列表（共 %d 个，正常 %d / 异常 %d）"
+        % (len(nodes), len(normals), len(abnormals)),
+        "",
+        _md_table(NODE_HEADERS, [_node_row(n) for n in normals]),
+    ]
+    if not nodes:
+        lines += ["", "_该集群未返回节点信息。_"]
+    if abnormals:
+        lines += [
+            "",
+            "## ⚠ 异常节点（共 %d 个，已与正常节点分开列出，请优先排查）"
+            % len(abnormals),
+            "",
+            _md_table(NODE_HEADERS, [_node_row(n) for n in abnormals]),
+        ]
+    if high_usage:
+        lines += [
+            "",
+            "## ⚠ 磁盘使用率 ≥80%% 的节点（共 %d 个）" % len(high_usage),
+            "",
+            _md_table(["节点名", "节点ID", "磁盘使用率"],
+                      [[n["name"], n["id"],
+                        _usage_text(n.get("usage_percent"), True)]
+                       for n in high_usage]),
+        ]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_markdown(content, output_path):
+    """Write ``content`` to ``output_path`` atomically (UTF-8 temp + rename).
+
+    Missing parent directories are created. An interrupted write never leaves
+    a corrupt / partial file behind.
+    """
+    target = os.path.abspath(output_path)
+    try:
+        directory = os.path.dirname(target)
+        os.makedirs(directory, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".css-md-", suffix=".tmp",
+                                            dir=directory)
+    except (OSError, ValueError) as exc:
+        raise ApiError("Markdown 文件写出失败（目录 %s 不可创建）：%s"
+                       % (os.path.dirname(target), exc))
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, target)
+    except (OSError, ValueError) as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ApiError("Markdown 文件写出失败（%s）：%s" % (output_path, exc))
+    return output_path
+
+
+def resolve_output_path(value):
+    """Resolve ``--output`` into a concrete path (default: cwd/css_clusters.md)."""
+    if not value or value is True:
+        return os.path.join(os.getcwd(), DEFAULT_OUTPUT)
+    return str(value)
+
+
+def _generated_at():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _filter_descriptions(args):
+    """Human-readable active filter list, aligned with the terminal views."""
+    filters = []
+    if args.name:
+        filters.append("name=%s%s" % (args.name,
+                                      "(fuzzy)" if args.fuzzy else ""))
+    if args.status:
+        filters.append("status=%s" % args.status)
+    if args.datastore_type:
+        filters.append("datastoreType=%s" % args.datastore_type)
+    return filters
+
+
+def _print_export_message(output_path, label, count, filters,
+                          to_stderr=False):
+    stream = sys.stderr if to_stderr else sys.stdout
+    print("已生成 Markdown 文件：%s（%s，共 %d 个，%s）。"
+          % (os.path.abspath(output_path), label, count, _filter_text(filters)),
+          file=stream)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1237,6 +1482,10 @@ def parse_args(argv=None):
                         help="以 JSON 输出原始响应")
     parser.add_argument("--table", action="store_true", dest="as_table",
                         help="输出完整字段集群视图（配合 --cluster-id 输出节点视图）")
+    parser.add_argument("-o", "--output", nargs="?", const=DEFAULT_OUTPUT,
+                        default=None, metavar="FILE",
+                        help="导出 Markdown 文件（默认当前目录 %s）；"
+                             "仅本参数触发导出" % DEFAULT_OUTPUT)
     parser.add_argument("--name", help="按集群名称过滤（默认精确匹配）")
     parser.add_argument("--fuzzy", action="store_true", dest="fuzzy",
                         help="--name 使用模糊（子串）匹配")
@@ -1288,6 +1537,17 @@ def main(argv=None):
             except CssListError as exc:
                 disk_infos = []
                 print("[提示] 未能获取节点磁盘使用率：%s" % exc, file=sys.stderr)
+            if args.output is not None:
+                instances = _field(detail, "instances", default=[])
+                node_count = len(instances) if isinstance(instances, list) else 0
+                output_path = resolve_output_path(args.output)
+                content = render_markdown_node_view(
+                    args.region, detail, disk_infos,
+                    generated_at=_generated_at())
+                write_markdown(content, output_path)
+                _print_export_message(
+                    output_path, "集群 %s 节点视图" % args.cluster_id,
+                    node_count, [], to_stderr=args.as_json)
             if args.as_json:
                 print(json.dumps({"cluster": detail,
                                   "volumeUsage": disk_infos},
@@ -1302,6 +1562,19 @@ def main(argv=None):
             max_pages=max(1, args.max_pages))
         clusters = filter_clusters(
             clusters, name=args.name, fuzzy=args.fuzzy, status=args.status)
+
+        usage_lookup = None
+        if args.output is not None:
+            usage_lookup = _usage_percent_lookup(args.region, clusters)
+            filters_desc = _filter_descriptions(args)
+            output_path = resolve_output_path(args.output)
+            content = render_markdown_cluster_view(
+                args.region, clusters, usage_lookup=usage_lookup,
+                filters=filters_desc, generated_at=_generated_at())
+            write_markdown(content, output_path)
+            _print_export_message(
+                output_path, "Region %s 集群视图" % args.region,
+                len(clusters), filters_desc, to_stderr=args.as_json)
 
         if args.as_json:
             print(json.dumps(clusters, ensure_ascii=False, indent=2))
@@ -1322,7 +1595,8 @@ def main(argv=None):
             return 0
 
         if args.as_table:
-            usage_lookup = _usage_percent_lookup(args.region, clusters)
+            if usage_lookup is None:
+                usage_lookup = _usage_percent_lookup(args.region, clusters)
             print(render_cluster_view(args.region, clusters,
                                       with_usage=True,
                                       usage_lookup=usage_lookup))

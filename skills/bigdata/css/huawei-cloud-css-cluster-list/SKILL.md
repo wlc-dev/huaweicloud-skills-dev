@@ -15,16 +15,24 @@ description: |
   4. Abnormal cluster status (anything other than `200`), disk usage >= 80% and
      abnormal nodes are highlighted in a separate section, never mixed with normal
      rows; `--status abnormal` lists only abnormal clusters.
-  5. Filters: `--name` (`--fuzzy` for substring), `--cluster-id` drill-down,
+  5. Markdown export: `--output` / `-o [FILE]` additionally writes the table view
+     to a local UTF-8 Markdown file (default `css_clusters.md` in the current
+     directory) and prints the absolute path; cluster view keeps the same fields
+     as `--table` plus the abnormal / capacity / abnormal-node sections, and the
+     node view (`--output` with `--cluster-id`) keeps the same fields as the
+     terminal node view. Filters apply to the exported rows exactly as they do to
+     the terminal output; an empty result still writes a header-only document
+     (exit 0). Terminal output and `--json` are unchanged.
+  6. Filters: `--name` (`--fuzzy` for substring), `--cluster-id` drill-down,
      `--status` (client-side), `--datastore-type` (elasticsearch / opensearch),
      `--region` (default cn-north-4). `--limit` 1..100 with automatic paging.
-  6. SDK fallback: when hcloud is missing, the script uses the official
+  7. SDK fallback: when hcloud is missing, the script uses the official
      `huaweicloudsdkcss` v1 SDK with the same read-only semantics.
-  7. Strict write-intent guard: create / delete / restart / reboot / update / scale /
+  8. Strict write-intent guard: create / delete / restart / reboot / update / scale /
      shrink / snapshot intents are rejected before execution (exit 1).
-  8. Explicit, actionable errors for empty results, 403 / IAM denial, missing
+  9. Explicit, actionable errors for empty results, 403 / IAM denial, missing
      credentials, `[USE_ERROR]` parameter problems and non-existent clusters.
-  9. Triggers include: "list CSS clusters", "CSS cluster list", "CSS 集群列表",
+  10. Triggers include: "list CSS clusters", "CSS cluster list", "CSS 集群列表",
      "查询云搜索服务集群", "Elasticsearch cluster inventory", "OpenSearch cluster list",
      "CSS 容量巡检", "CSS 节点异常排查", "huawei-cloud-css-cluster-list",
      "list cloud search service clusters".
@@ -61,6 +69,11 @@ Key properties:
   whose disk usage is at least 80%, and nodes whose status is not `200` are
   listed in dedicated highlighted sections instead of being mixed with normal
   rows.
+- **Optional Markdown export** — `--output` / `-o [FILE]` writes the table view
+  (cluster view by default, node view with `--cluster-id`) to a local UTF-8
+  Markdown file with atomic replace, keeping the same fields and the same
+  abnormal / capacity sections as the terminal output. It never touches Huawei
+  Cloud and never changes the terminal or `--json` behaviour.
 - **Offline-testable** — paging, filtering, error classification, rendering and
   the write-intent guard are covered by unit tests that mock the hcloud
   subprocess and inject a fake SDK module.
@@ -94,7 +107,10 @@ and explicit user confirmation.
    cluster view, or `--table --cluster-id <id>` for the node view.
 4. **Read the result** — normal rows first, then the highlighted abnormal
    sections; `--json` for downstream tooling.
-5. **Handle empty / error cases** per the Edge Cases table (empty region, 403,
+5. **Optionally export** — add `--output [FILE]` to also write the table view to
+   a Markdown file (default `./css_clusters.md`, absolute path printed). Add
+   `--cluster-id` to export the node view instead.
+6. **Handle empty / error cases** per the Edge Cases table (empty region, 403,
    missing AK/SK, unknown parameter, non-existent cluster).
 
 ## Core Commands
@@ -117,6 +133,16 @@ python3 scripts/list_css_clusters.py --cluster-id <cluster-id> --json
 python3 scripts/list_css_clusters.py --name css-prod --fuzzy
 python3 scripts/list_css_clusters.py --status abnormal
 python3 scripts/list_css_clusters.py --datastore-type opensearch
+
+# Export the cluster view to Markdown (default ./css_clusters.md)
+python3 scripts/list_css_clusters.py --region cn-north-4 --output
+python3 scripts/list_css_clusters.py --region cn-north-4 -o reports/css_capacity.md
+
+# Export the node view (same fields as the terminal node view)
+python3 scripts/list_css_clusters.py --cluster-id <cluster-id> --output nodes.md
+
+# Filters and export together (exported rows match the terminal rows)
+python3 scripts/list_css_clusters.py --status abnormal --output abnormal.md
 ```
 
 Equivalent direct KooCLI calls (the script wraps exactly these, with paging):
@@ -134,6 +160,7 @@ hcloud CSS ShowClusterVolumeUsage --cli-region=cn-north-4 --cluster_id=<cluster-
 | `--region` / `-r` | No | Huawei Cloud region (default `cn-north-4`) | `cn-south-1` |
 | `--json` | No | Output the raw cluster array / node response as JSON | — |
 | `--table` | No | Full-field cluster view (node view with `--cluster-id`) | — |
+| `--output` / `-o` | No | Also export the table view to a local Markdown file; the value is optional (default `css_clusters.md` in the current directory, absolute path printed) | `reports/css.md` |
 | `--name` | No | Filter by cluster name (exact by default) | `css-prod-01` |
 | `--fuzzy` | No | Use substring (case-insensitive) matching for `--name` | — |
 | `--cluster-id` | No | Drill into one cluster: detail + node list | `<cluster-id>` |
@@ -144,7 +171,9 @@ hcloud CSS ShowClusterVolumeUsage --cli-region=cn-north-4 --cluster_id=<cluster-
 | `--action` | No | Explicit read-only intent; only `list` / `detail` / `volume` are allowed | `list` |
 
 Output-mode precedence: `--cluster-id` (node view) → `--json` → `--table` →
-compact list.
+compact list. `--output` is additive: it never replaces the terminal mode. When
+combined with `--json`, the JSON stays on stdout (the export hint goes to
+stderr); otherwise the export hint is printed to stdout.
 
 Status semantics (from the official CSS v1 API reference / SDK models):
 `100` creating, `200` available, `303` unavailable (for example a failed
@@ -187,7 +216,8 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 
 | Scenario | Behavior |
 | ---------- | --------- |
-| Empty cluster list | Exit 0, prints `Region <x> 下暂无 CSS 集群` (+ active filter) |
+| Empty cluster list | Exit 0, prints `Region <x> 下暂无 CSS 集群` (+ active filter); with `--output` a header-only Markdown file is still written |
+| Markdown output path not writable | Exit 1, explicit `Markdown 文件写出失败（...）` hint, no partial file left behind |
 | 403 / IAM policy denies `css:cluster:list` | Exit 1, explicit hint to check credentials and grant `css:cluster:list` / `css:cluster:get` |
 | Missing / invalid AK-SK | Exit 1, explicit hint to configure hcloud credentials out-of-band (never in chat) |
 | hcloud not installed | SDK fallback; if the SDK is also unavailable, exit 1 with install hints |
@@ -207,6 +237,9 @@ Exit codes: `0` success / empty region; `1` config, auth, guard or API error.
 | Abnormal node | Listed in a dedicated abnormal-node section |
 | Volume usage forbidden (403) | Cluster view still renders; usage is `-` and a hint is printed to stderr |
 | Large cluster count | Automatic `offset`/`limit` paging driven by `totalSize` (max 200 pages) |
+| `--output` with an empty result | File is still created with the table header (and an explicit "no clusters" note); exit 0 |
+| `--output` path contains mutating words (e.g. `delete-report.md`) | The path is caller data, not an intent; the write-intent scan ignores `--output` values |
+| `--output` with a nested path | Missing parent directories are created; the temp file is written in the target directory and atomically renamed |
 | Extra response fields | `--json` returns the raw record untouched; table uses known fields |
 | Field missing on a cluster / node | Rendered as `-` |
 | Non-JSON hcloud output | `ApiError` with the raw excerpt (first 200 chars) |
@@ -227,8 +260,11 @@ scale / shrink / snapshot / normalized variants / operation and action
 whitelists / status-value handling), command construction, JSON extraction, CSS
 error-envelope detection, failure classification (missing AK/SK, 403 / CSS.0051,
 `[USE_ERROR]`, generic), paging (totalSize / full-page / dedupe), SDK fallback
-(list/detail/volume), filtering, normalization and all main() output modes
-including empty, node view, JSON and error paths.
+(list/detail/volume), filtering, normalization, all main() output modes
+including empty, node view, JSON and error paths, and the Markdown export
+(cluster/node field parity, default filename and absolute-path hint, filter
+consistency, header-only empty result, UTF-8 + atomic write, write-intent
+guard before any hcloud call).
 
 ## Reference Documents
 

@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -24,6 +25,7 @@ from list_css_clusters import (  # noqa: E402
     ConfigError,
     GuardError,
     DEFAULT_LIMIT,
+    DEFAULT_OUTPUT,
     MAX_LIMIT,
     build_detail_command,
     build_list_command,
@@ -44,14 +46,18 @@ from list_css_clusters import (  # noqa: E402
     normalize_cluster,
     normalize_node,
     render_cluster_view,
+    render_markdown_cluster_view,
+    render_markdown_node_view,
     render_node_view,
     render_simple_view,
     render_table,
+    resolve_output_path,
     scannable_argv,
     show_cluster,
     show_cluster_via_sdk,
     show_volume_usage,
     show_volume_usage_via_sdk,
+    write_markdown,
 )
 
 CLUSTER_1 = {
@@ -591,6 +597,77 @@ class TestRendering(unittest.TestCase):
         self.assertIn("⚠ 异常状态集群", text)
 
 
+class TestMarkdownExport(unittest.TestCase):
+    def test_cluster_markdown_same_fields_as_table(self):
+        doc = render_markdown_cluster_view(
+            "cn-north-4", [CLUSTER_1, CLUSTER_2],
+            usage_lookup={"c-0002": 85.0}, filters=["status=abnormal"])
+        for header in css.CLUSTER_HEADERS:
+            self.assertIn(header, doc)
+        self.assertIn("# Huawei Cloud CSS 集群列表", doc)
+        self.assertIn("css-prod-01", doc)
+        self.assertIn("## ⚠ 异常状态集群", doc)
+        self.assertIn("## ⚠ 容量使用率 ≥80%", doc)
+        self.assertIn("85.00%", doc)
+        self.assertIn("过滤条件: status=abnormal", doc)
+
+    def test_cluster_markdown_normal_only(self):
+        doc = render_markdown_cluster_view("cn-north-4", [CLUSTER_1])
+        self.assertIn("css-prod-01", doc)
+        self.assertNotIn("## ⚠ 异常状态集群", doc)
+        self.assertNotIn("## ⚠ 容量使用率", doc)
+
+    def test_cluster_markdown_empty_keeps_header(self):
+        doc = render_markdown_cluster_view("cn-south-1", [])
+        for header in css.CLUSTER_HEADERS:
+            self.assertIn(header, doc)
+        self.assertIn("| --- |", doc)
+        self.assertIn("无 CSS 集群", doc)
+
+    def test_node_markdown_same_fields_as_table(self):
+        infos = [{"id": "n-0002", "percentage": "81.5",
+                  "diskCapacity": "100", "diskUsed": "81.5"}]
+        doc = render_markdown_node_view("cn-north-4", CLUSTER_2, infos)
+        for header in css.NODE_HEADERS:
+            self.assertIn(header, doc)
+        self.assertIn("## ⚠ 异常节点", doc)
+        self.assertIn("## ⚠ 磁盘使用率 ≥80%", doc)
+        self.assertIn("81.50%", doc)
+
+    def test_node_markdown_empty_keeps_header(self):
+        doc = render_markdown_node_view(
+            "cn-north-4", {"id": "c-x", "name": "empty", "instances": []}, [])
+        for header in css.NODE_HEADERS:
+            self.assertIn(header, doc)
+        self.assertIn("未返回节点信息", doc)
+
+    def test_md_cell_escapes_pipes_and_newlines(self):
+        doc = render_markdown_cluster_view(
+            "cn-north-4", [{"id": "c|1", "name": "a\nb", "status": "200"}])
+        self.assertIn("c\\|1", doc)
+        self.assertIn("a b", doc)
+
+    def test_write_markdown_utf8_and_parent_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "dir", "css.md")
+            write_markdown("# 中文标题\n| 列 |\n| --- |\n", path)
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertIn("中文标题", handle.read())
+
+    def test_write_markdown_failure_raises_and_leaves_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ApiError):
+                write_markdown("content", os.path.join(tmp, "\0bad.md"))
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_resolve_output_path(self):
+        self.assertEqual(resolve_output_path(None),
+                         os.path.join(os.getcwd(), DEFAULT_OUTPUT))
+        self.assertEqual(resolve_output_path(""),
+                         os.path.join(os.getcwd(), DEFAULT_OUTPUT))
+        self.assertEqual(resolve_output_path("docs/css.md"), "docs/css.md")
+
+
 class TestMain(base_env):
     def _run(self, argv, results, extra_env=None):
         fake = FakeRunner(results)
@@ -756,6 +833,118 @@ class TestMain(base_env):
             rc = main(["--limit", "500"])
         self.assertEqual(rc, 0)
         self.assertIn("--limit=%d" % MAX_LIMIT, fake.calls[0])
+
+    def test_output_default_filename_in_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("os.getcwd", return_value=tmp):
+                rc, out, err = self._run(
+                    ["--output"],
+                    [(json.dumps({"clusters": [CLUSTER_1], "totalSize": 1}),
+                      "", 0),
+                     (json.dumps({"diskInfoList": [
+                         {"id": "n-0001", "percentage": "5.16"}]}), "", 0)])
+            path = os.path.join(tmp, DEFAULT_OUTPUT)
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(path))
+            self.assertIn(os.path.abspath(path), out)
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("css-prod-01", content)
+            self.assertIn(css.CLUSTER_HEADERS[0], content)
+
+    def test_output_explicit_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report", "css.md")
+            rc, out, err = self._run(
+                ["--output", path],
+                [(json.dumps({"clusters": [CLUSTER_1, CLUSTER_2],
+                              "totalSize": 2}), "", 0),
+                 (json.dumps({"diskInfoList": [
+                     {"id": "n-0001", "percentage": "5.16"}]}), "", 0),
+                 (json.dumps({"diskInfoList": [
+                     {"id": "n-0002", "percentage": "85.0"}]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(path))
+            self.assertIn(os.path.abspath(path), out)
+
+    def test_output_filters_match_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "css.md")
+            rc, out, err = self._run(
+                ["--output", path, "--status", "abnormal"],
+                [(json.dumps({"clusters": [CLUSTER_1, CLUSTER_2],
+                              "totalSize": 2}), "", 0),
+                 (json.dumps({"diskInfoList": [
+                     {"id": "n-0002", "percentage": "85.0"}]}), "", 0)])
+            self.assertEqual(rc, 0)
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("css-test-02", content)
+            self.assertNotIn("css-prod-01", content)
+            self.assertNotIn("css-prod-01", out)
+            self.assertIn("status=abnormal", content)
+
+    def test_output_empty_result_still_writes_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "css.md")
+            rc, out, err = self._run(
+                ["--output", path, "--status", "abnormal"],
+                [(json.dumps({"clusters": [], "totalSize": 0}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertIn("暂无 CSS 集群", out)
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn(css.CLUSTER_HEADERS[0], content)
+            self.assertIn("| --- |", content)
+
+    def test_output_node_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "css-nodes.md")
+            rc, out, err = self._run(
+                ["--table", "--cluster-id", "c-0002", "--output", path],
+                [(json.dumps(CLUSTER_2), "", 0),
+                 (json.dumps({"diskInfoList": [
+                     {"id": "n-0002", "percentage": "81.5",
+                      "diskCapacity": "100", "diskUsed": "81.5"}]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(path))
+            self.assertIn("节点列表", out)
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn(css.NODE_HEADERS[0], content)
+            self.assertIn("## ⚠ 异常节点", content)
+
+    def test_output_write_intent_blocked_before_any_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "css.md")
+            rc, out, err = self._run(
+                ["--output", path, "--name", "create-me"], [])
+            self.assertEqual(rc, 1)
+            self.assertIn("写操作意图", err)
+            self.assertFalse(os.path.exists(path))
+
+    def test_output_path_with_write_keyword_not_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "delete-report.md")
+            rc, out, err = self._run(
+                ["--output", path],
+                [(json.dumps({"clusters": [CLUSTER_1], "totalSize": 1}),
+                  "", 0),
+                 (json.dumps({"diskInfoList": []}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.exists(path))
+
+    def test_output_with_json_keeps_json_stdout_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "css.md")
+            rc, out, err = self._run(
+                ["--json", "--output", path],
+                [(json.dumps({"clusters": [CLUSTER_1], "totalSize": 1}),
+                  "", 0),
+                 (json.dumps({"diskInfoList": []}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out), [CLUSTER_1])
+            self.assertIn(os.path.abspath(path), err)
 
 
 class TestErrorHierarchy(unittest.TestCase):
