@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from list_vpc import (  # noqa: E402
     ALLOWED_OPERATION,
     MD_HEADERS,
+    PEERING_OPERATION,
     ApiError,
     AuthError,
     ConfigError,
@@ -18,20 +19,27 @@ from list_vpc import (  # noqa: E402
     GuardError,
     VpcListError,
     build_command,
+    build_peering_command,
     classify_hcloud_failure,
     default_output_path,
     export_markdown,
     extract_json,
+    extract_peerings,
     extract_vpcs,
     guard_operation,
     guard_text_from_argv,
     guard_write_intent,
+    list_peerings,
+    list_peerings_via_sdk,
     list_vpcs,
     list_vpcs_via_sdk,
     main,
+    normalize_peering,
     normalize_vpc,
     normalized_row,
+    peering_names,
     render_markdown,
+    render_peering_table,
     render_table,
     vpc_names,
 )
@@ -60,6 +68,22 @@ VPC_2 = {
     "routes": [],
     "enterprise_project_id": "0",
     "tenant_id": "tenant-0001",
+}
+PEERING_1 = {
+    "id": "peering-0001",
+    "name": "peering-a-to-b",
+    "status": "ACTIVE",
+    "request_vpc_info": {"vpc_id": "vpc-0001", "tenant_id": "tenant-0001"},
+    "accept_vpc_info": {"vpc_id": "vpc-0002", "tenant_id": "tenant-0001"},
+    "created_at": "2024-01-01T00:00:00",
+    "updated_at": "2024-01-02T00:00:00",
+}
+PEERING_2 = {
+    "id": "peering-0002",
+    "name": "peering-c-to-d",
+    "status": "PENDING_ACCEPTANCE",
+    "request_vpc_info": {"vpc_id": "vpc-0003"},
+    "accept_vpc_info": {"vpc_id": "vpc-0004"},
 }
 
 
@@ -898,6 +922,385 @@ class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
         for exc in (GuardError, ConfigError, AuthError, ApiError, ExportError):
             self.assertTrue(issubclass(exc, VpcListError))
+
+
+class TestPeeringGuard(unittest.TestCase):
+    def test_peering_operation_allowed(self):
+        self.assertTrue(guard_operation(PEERING_OPERATION, allowed=PEERING_OPERATION))
+
+    def test_peering_write_operation_blocked(self):
+        with self.assertRaises(GuardError):
+            guard_operation("CreateVpcPeering", allowed=PEERING_OPERATION)
+
+    def test_peering_write_intent_blocked(self):
+        for text in ("CreateVpcPeering", "DeleteVpcPeering",
+                     "AcceptVpcPeering", "RejectVpcPeering",
+                     "UpdateVpcPeering", "--create-vpc-peering"):
+            with self.assertRaises(GuardError):
+                guard_write_intent(text)
+
+    def test_peering_resource_flag_passes(self):
+        self.assertFalse(guard_write_intent("--resource peering --region cn-north-4"))
+
+    def test_vpc_operation_not_allowed_in_peering_mode(self):
+        with self.assertRaises(GuardError):
+            guard_operation(ALLOWED_OPERATION, allowed=PEERING_OPERATION)
+
+
+class TestBuildPeeringCommand(unittest.TestCase):
+    def test_basic(self):
+        argv = build_peering_command("cn-north-4")
+        self.assertEqual(argv[0], "VPC")
+        self.assertEqual(argv[1], "ListVpcPeerings")
+        self.assertIn("--cli-region=cn-north-4", argv)
+        self.assertIn("--limit=100", argv)
+        self.assertFalse(any(flag.startswith("--marker") for flag in argv))
+
+    def test_marker_appended(self):
+        argv = build_peering_command("cn-north-4", marker="tok-123", limit=10)
+        self.assertIn("--marker=tok-123", argv)
+        self.assertIn("--limit=10", argv)
+
+    def test_no_write_flags_ever_added(self):
+        argv = build_peering_command("cn-north-4")
+        for flag in argv:
+            self.assertFalse(flag.lower().lstrip("-").startswith(
+                ("create", "delete", "update", "accept", "reject")))
+
+
+class TestExtractPeerings(unittest.TestCase):
+    def test_extract_peerings_known_keys(self):
+        for key in ("peerings", "peering"):
+            self.assertEqual(extract_peerings({key: [PEERING_1]}), [PEERING_1])
+        self.assertEqual(extract_peerings([PEERING_1]), [PEERING_1])
+        self.assertEqual(extract_peerings({"page_info": {}}), [])
+
+
+class TestListPeerings(unittest.TestCase):
+    def test_single_page(self):
+        fake = FakeRunner([(
+            json.dumps({"peerings": [PEERING_1, PEERING_2]}), "", 0)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            peerings = list_peerings("cn-north-4")
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn("ListVpcPeerings", fake.calls[0])
+
+    def test_pagination_via_next_marker(self):
+        page1 = {"peerings": [PEERING_1],
+                 "page_info": {"next_marker": "tok-2", "current_count": 1}}
+        page2 = {"peerings": [PEERING_2],
+                 "page_info": {"next_marker": None, "current_count": 1}}
+        fake = FakeRunner([(json.dumps(page1), "", 0), (json.dumps(page2), "", 0)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            peerings = list_peerings("cn-north-4", limit=1)
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        self.assertEqual(len(fake.calls), 2)
+        self.assertIn("--marker=tok-2", fake.calls[1])
+
+    def test_pagination_via_full_page_without_marker(self):
+        page1 = {"peerings": [PEERING_1]}
+        page2 = {"peerings": []}
+        fake = FakeRunner([(json.dumps(page1), "", 0), (json.dumps(page2), "", 0)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            peerings = list_peerings("cn-north-4", limit=1)
+        self.assertEqual(peerings, [PEERING_1])
+
+    def test_empty_region(self):
+        fake = FakeRunner([(json.dumps({"peerings": []}), "", 0)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            peerings = list_peerings("cn-north-4")
+        self.assertEqual(peerings, [])
+
+    def test_use_error_rc0_raises_api_error(self):
+        fake = FakeRunner([(
+            "[USE_ERROR]Invalid parameter: status\n\n"
+            "Run `hcloud VPC ListVpcPeerings --help` for details.", "", 0)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            with self.assertRaises(ApiError) as ctx:
+                list_peerings("cn-north-4")
+        self.assertIn("参数错误", str(ctx.exception))
+        self.assertIn("ListVpcPeerings", str(ctx.exception))
+
+    def test_nonzero_exit_403(self):
+        fake = FakeRunner([("", "403 Forbidden", 1)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            with self.assertRaises(AuthError):
+                list_peerings("cn-north-4")
+
+    def test_nonzero_exit_credentials(self):
+        fake = FakeRunner([("", "ERROR: no AK configured", 1)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            with self.assertRaises(ConfigError):
+                list_peerings("cn-north-4")
+
+    def test_timeout(self):
+        fake = FakeRunner([subprocess.TimeoutExpired(cmd="hcloud", timeout=120)])
+        with mock.patch("list_vpc.subprocess.run", fake):
+            with self.assertRaises(ApiError):
+                list_peerings("cn-north-4")
+
+    def test_sdk_fallback_when_hcloud_missing(self):
+        with mock.patch("list_vpc.subprocess.run",
+                        FakeRunner([FileNotFoundError()])), \
+                mock.patch("list_vpc.list_peerings_via_sdk",
+                           return_value=[PEERING_1, PEERING_2]) as sdk_mock:
+            peerings = list_peerings("cn-north-4", project_id="proj-1")
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        self.assertEqual(sdk_mock.call_args.kwargs.get("project_id"), "proj-1")
+
+    def test_sdk_fallback_unavailable_raises_config(self):
+        with mock.patch("list_vpc.subprocess.run",
+                        FakeRunner([FileNotFoundError()])), \
+                mock.patch("list_vpc.list_peerings_via_sdk",
+                           side_effect=ConfigError("huaweicloudsdkvpc 未安装")):
+            with self.assertRaises(ConfigError):
+                list_peerings("cn-north-4")
+
+    def test_sdk_request_signature(self):
+        try:
+            from huaweicloudsdkvpc.v2 import ListVpcPeeringsRequest
+        except ImportError:
+            self.skipTest("huaweicloudsdkvpc not installed")
+        request = ListVpcPeeringsRequest(limit=100, marker=None)
+        self.assertEqual(request.limit, 100)
+        with self.assertRaises(TypeError):
+            ListVpcPeeringsRequest(no_such_param=1)
+
+
+class _FakeSdkPeeringResponse:
+    def __init__(self, peerings, next_marker=None):
+        self.peerings = peerings
+
+        class _PageInfo:
+            pass
+
+        if next_marker is not None:
+            page = _PageInfo()
+            page.next_marker = next_marker
+            self.page_info = page
+
+
+class _FakeSdkPeering:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def to_dict(self):
+        return self._payload
+
+
+class _FakeSdkPeeringBuilder:
+    def __init__(self, test):
+        self._test = test
+
+    def with_credentials(self, credentials):
+        self._test._captured_credentials = credentials
+        return self
+
+    def with_region(self, region):
+        self._test._captured_region = region
+        return self
+
+    def with_http_config(self, config):
+        return self
+
+    def build(self):
+        return self._test._fake_client
+
+
+class TestPeeringSdkFallback(unittest.TestCase):
+    def setUp(self):
+        self._captured_credentials = None
+        self._captured_region = None
+        self._fake_client = mock.Mock()
+        self._fake_client.list_vpc_peerings.return_value = (
+            _FakeSdkPeeringResponse(
+                [_FakeSdkPeering(PEERING_1), _FakeSdkPeering(PEERING_2)], None))
+        try:
+            import huaweicloudsdkvpc.v2 as vpc_v2
+        except ImportError:
+            self.skipTest("huaweicloudsdkvpc not installed")
+        self._builder_patch = mock.patch.object(
+            vpc_v2.VpcClient, "new_builder",
+            classmethod(lambda cls: _FakeSdkPeeringBuilder(self)))
+        self._builder_patch.start()
+        self.addCleanup(self._builder_patch.stop)
+
+    def _clean_credential_env(self):
+        credential_vars = (
+            "HW_ACCESS_KEY", "HUAWEI_ACCESS_KEY", "HUAWEICLOUD_SDK_AK",
+            "HUAWEI_CLOUD_ACCESS_KEY", "HW_SECRET_KEY", "HUAWEI_SECRET_KEY",
+            "HUAWEICLOUD_SDK_SK", "HUAWEI_CLOUD_SECRET_KEY", "HW_PROJECT_ID",
+            "HUAWEI_PROJECT_ID", "HUAWEICLOUD_SDK_PROJECT_ID",
+            "HUAWEI_CLOUD_PROJECT_ID",
+        )
+        return {name: "" for name in credential_vars}
+
+    def test_official_peering_imports_resolve(self):
+        from huaweicloudsdkvpc.v2 import VpcClient, ListVpcPeeringsRequest
+        for obj in (VpcClient, ListVpcPeeringsRequest):
+            self.assertTrue(callable(obj), obj)
+
+    def test_sdk_fallback_returns_peerings_with_env_credentials(self):
+        env = dict(self._clean_credential_env(),
+                   HUAWEI_ACCESS_KEY="test-ak",
+                   HUAWEI_SECRET_KEY="test-sk",
+                   HUAWEI_PROJECT_ID="test-project")
+        with mock.patch.dict(os.environ, env, clear=True):
+            peerings = list_peerings_via_sdk("cn-north-4")
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        self.assertEqual(getattr(self._captured_credentials, "ak", None), "test-ak")
+        self.assertEqual(getattr(self._captured_region, "id", None), "cn-north-4")
+
+    def test_sdk_pagination_via_page_info(self):
+        first = _FakeSdkPeeringResponse([_FakeSdkPeering(PEERING_1)], "tok-2")
+        second = _FakeSdkPeeringResponse([_FakeSdkPeering(PEERING_2)], None)
+        self._fake_client.list_vpc_peerings.side_effect = [first, second]
+        env = dict(self._clean_credential_env(),
+                   HUAWEI_ACCESS_KEY="test-ak",
+                   HUAWEI_SECRET_KEY="test-sk",
+                   HUAWEI_PROJECT_ID="test-project")
+        with mock.patch.dict(os.environ, env, clear=True):
+            peerings = list_peerings_via_sdk("cn-north-4")
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        second_request = self._fake_client.list_vpc_peerings.call_args_list[1][0][0]
+        self.assertEqual(second_request.marker, "tok-2")
+
+    def test_sdk_pagination_via_last_id_when_page_full(self):
+        first = _FakeSdkPeeringResponse(
+            [_FakeSdkPeering(PEERING_1), _FakeSdkPeering(PEERING_2)], None)
+        second = _FakeSdkPeeringResponse([], None)
+        self._fake_client.list_vpc_peerings.side_effect = [first, second]
+        env = dict(self._clean_credential_env(),
+                   HUAWEI_ACCESS_KEY="test-ak",
+                   HUAWEI_SECRET_KEY="test-sk",
+                   HUAWEI_PROJECT_ID="test-project")
+        with mock.patch.dict(os.environ, env, clear=True):
+            peerings = list_peerings_via_sdk("cn-north-4", limit=2)
+        self.assertEqual(peerings, [PEERING_1, PEERING_2])
+        second_request = self._fake_client.list_vpc_peerings.call_args_list[1][0][0]
+        self.assertEqual(second_request.marker, "peering-0002")
+
+
+class TestPeeringNormalizeAndRender(unittest.TestCase):
+    def test_normalize_maps_local_and_peer_vpc(self):
+        row = normalize_peering(PEERING_1)
+        self.assertEqual(row["name"], "peering-a-to-b")
+        self.assertEqual(row["local_vpc"], "vpc-0001")
+        self.assertEqual(row["peer_vpc"], "vpc-0002")
+        self.assertEqual(row["status"], "ACTIVE")
+
+    def test_normalize_missing_info_uses_dash(self):
+        row = normalize_peering({"id": "peering-9", "status": "ACTIVE"})
+        self.assertEqual(row["name"], "peering-9")
+        self.assertEqual(row["local_vpc"], "-")
+        self.assertEqual(row["peer_vpc"], "-")
+
+    def test_table_has_four_columns(self):
+        table = render_peering_table([PEERING_1, PEERING_2])
+        header = table.splitlines()[0]
+        for col in ("name", "local_vpc", "peer_vpc", "status"):
+            self.assertIn(col, header)
+        for fragment in ("peering-a-to-b", "vpc-0001", "vpc-0002", "ACTIVE",
+                         "peering-c-to-d", "PENDING_ACCEPTANCE"):
+            self.assertIn(fragment, table)
+
+    def test_peering_names(self):
+        self.assertEqual(
+            peering_names([PEERING_1, PEERING_2]),
+            ["peering-a-to-b", "peering-c-to-d"])
+        self.assertEqual(peering_names([{"id": "peering-9"}]), ["peering-9"])
+
+
+class TestPeeringMain(unittest.TestCase):
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_vpc.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    def test_peering_table_output(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--region", "cn-north-4"],
+            [(json.dumps({"peerings": [PEERING_1, PEERING_2]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("VPC 对等连接列表", out)
+        self.assertIn("local_vpc", out)
+        self.assertIn("peer_vpc", out)
+        self.assertIn("vpc-0001", out)
+        self.assertIn("vpc-0002", out)
+        self.assertEqual(err, "")
+
+    def test_peering_json_raw_output(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--json"],
+            [(json.dumps({"peerings": [PEERING_1]}), "", 0)])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload, [PEERING_1])
+        self.assertIn("request_vpc_info", payload[0])
+
+    def test_peering_names_only_output(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--names-only"],
+            [(json.dumps({"peerings": [PEERING_1, PEERING_2]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("peering-a-to-b", out)
+        self.assertIn("peering-c-to-d", out)
+        self.assertNotIn("local_vpc", out)
+
+    def test_peering_empty_message(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--region", "cn-south-1"],
+            [(json.dumps({"peerings": []}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("无对等连接（VPC Peering）", out)
+        self.assertIn("cn-south-1", out)
+
+    def test_peering_auth_error_message(self):
+        rc, out, err = self._run(["--resource", "peering"],
+                                 [("", "403 Forbidden", 1)])
+        self.assertEqual(rc, 1)
+        self.assertIn("[错误]", err)
+        self.assertIn("IAM", err)
+
+    def test_peering_missing_ak_sk_error_message(self):
+        rc, out, err = self._run(["--resource", "peering"],
+                                 [("", "ERROR: cli-ak empty", 1)])
+        self.assertEqual(rc, 1)
+        self.assertIn("AK/SK", err)
+
+    def test_peering_write_intent_blocked(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--operation", "CreateVpcPeering"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("写操作意图", err)
+
+    def test_peering_unsupported_filters_rejected(self):
+        rc, out, err = self._run(
+            ["--resource", "peering", "--id", "vpc-0001"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("不支持", err)
+
+    def test_peering_sdk_fallback_via_main(self):
+        with mock.patch("list_vpc.list_peerings_via_sdk",
+                        return_value=[PEERING_1]):
+            rc, out, err = self._run(
+                ["--resource", "peering"], [FileNotFoundError()])
+        self.assertEqual(rc, 0)
+        self.assertIn("peering-a-to-b", out)
+
+    def test_default_resource_still_vpc(self):
+        rc, out, err = self._run(
+            ["--region", "cn-north-4"],
+            [(json.dumps({"vpcs": [VPC_1]}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertIn("虚拟私有云（VPC）列表", out)
+        self.assertNotIn("对等连接", out)
 
 
 if __name__ == "__main__":

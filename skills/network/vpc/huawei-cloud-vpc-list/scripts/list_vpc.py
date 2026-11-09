@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""List Huawei Cloud Virtual Private Cloud (VPC) instances via KooCLI `hcloud VPC ListVpcs`.
+"""List Huawei Cloud Virtual Private Cloud (VPC) resources via KooCLI.
 
-Primary execution path is KooCLI (`hcloud VPC ListVpcs`, read-only
-GET /v1/{project_id}/vpcs); when hcloud is not installed the script falls back
-to the official `huaweicloudsdkvpc` v2 SDK (`VpcClient.list_vpcs`). Reads nothing
-but the active credential profile / environment. Supports full-field table
-(default), --json, --names-only and --format md (local Markdown report; optional
---output / --summary), --id / --enterprise-project-id filters (real server-side
-query parameters; ListVpcs `--id` is an array query parameter, emitted as
-`--id.1=<vpc-id>`), marker-based paging, and a strict write-intent guard: any
-argument that looks like a mutating VPC operation is rejected before a single
-command is executed.
+Read-only entry point for two resource families of the VPC service:
+
+* ``--resource vpc`` (default) — ``hcloud VPC ListVpcs`` (GET
+  /v1/{project_id}/vpcs); when hcloud is not installed the script falls back
+  to the official ``huaweicloudsdkvpc`` v2 SDK (``VpcClient.list_vpcs``).
+* ``--resource peering`` — ``hcloud VPC ListVpcPeerings`` (GET
+  /v2.0/{project_id}/vpc/peerings); SDK fallback uses
+  ``ListVpcPeeringsRequest`` / ``VpcClient.list_vpc_peerings``.
+
+Reads nothing but the active credential profile / environment. Supports
+full-field table (default), --json, --names-only and --format md (local
+Markdown report for the VPC resource; optional --output / --summary),
+--id / --enterprise-project-id filters (real server-side query parameters;
+ListVpcs ``--id`` is an array query parameter, emitted as ``--id.1=<vpc-id>``),
+marker-based paging, and a strict write-intent guard: any argument that looks
+like a mutating VPC operation is rejected before a single command is executed.
 
 Usage:
-    python3 scripts/list_vpc.py [--region cn-north-4] [--json | --names-only]
+    python3 scripts/list_vpc.py [--region cn-north-4] [--resource vpc|peering]
+                                [--json | --names-only]
                                 [--format table|json|names|md]
                                 [--output <path.md>] [--summary]
                                 [--id <vpc-id>] [--enterprise-project-id <id>]
                                 [--page-size 100] [--project-id <id>]
-                                [--operation ListVpcs]
+                                [--operation ListVpcs|ListVpcPeerings]
 
 Environment overrides (mostly for tests):
     VPC_LIST_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -43,7 +50,14 @@ DEFAULT_PAGE_SIZE = 100
 DEFAULT_FORMAT = "table"
 SERVICE = "VPC"
 ALLOWED_OPERATION = "ListVpcs"
+PEERING_OPERATION = "ListVpcPeerings"
+RESOURCE_OPERATIONS = {
+    "vpc": ALLOWED_OPERATION,
+    "peering": PEERING_OPERATION,
+}
 REST_PATH = "/v1/{project_id}/vpcs"
+PEERING_REST_PATH = "/v2.0/{project_id}/vpc/peerings"
+PEERING_TABLE_COLUMNS = ("name", "local_vpc", "peer_vpc", "status")
 
 # Markdown report column order (the first column is the required VPC name) —
 # kept identical to huawei-cloud-vpc-export-markdown (8 fixed columns).
@@ -95,6 +109,7 @@ WRITE_INTENT_KEYWORDS = (
     "deletevpcpeering",
     "acceptvpcpeering",
     "rejectvpcpeering",
+    "updatevpcpeering",
     "create",
     "delete",
     "update",
@@ -203,18 +218,18 @@ def guard_write_intent(text):
         if keyword in low:
             raise GuardError(
                 "检测到写操作意图（关键词: %s）。本 skill 仅支持只读查询"
-                "（VPC ListVpcs），创建/删除/更新/绑定/解绑的变更操作已被守卫拦截。"
+                "（VPC ListVpcs / ListVpcPeerings），创建/删除/更新/绑定/解绑的变更操作已被守卫拦截。"
                 % keyword
             )
     return False
 
 
-def guard_operation(operation):
-    """Only the read-only ListVpcs operation may be executed."""
-    if operation != ALLOWED_OPERATION:
+def guard_operation(operation, allowed=ALLOWED_OPERATION):
+    """Only the whitelisted read-only operation may be executed."""
+    if operation != allowed:
         raise GuardError(
             "不允许的操作 %r：本 skill 仅允许只读操作 %s。"
-            % (operation, ALLOWED_OPERATION)
+            % (operation, allowed)
         )
     return True
 
@@ -254,8 +269,11 @@ def build_command(region, vpc_id=None, enterprise_project_id=None,
     """Build the hcloud VPC ListVpcs argv (without the executable).
 
     Mirrors the real KooCLI parameter list for the read-only VPC ListVpcs
-    operation: --cli-region / --limit / --marker and the real server-side
-    filters --id / --enterprise_project_id. VPC pages with `limit` + `marker`
+    v3 operation: --cli-region / --limit / --marker and the real server-side
+    filters --id / --enterprise_project_id. KooCLI only accepts the *array*
+    form for the VPC id filter (`--id.1=<vpc-id>`, as declared in the
+    operation help listing); the scalar `--id=<vpc-id>` spelling is rejected
+    with `[USE_ERROR]Invalid parameter: id`. VPC pages with `limit` + `marker`
     (the next_marker comes from the response page_info).
 
     ListVpcs is a v3 API where `id` is declared as ``array<string>``, so KooCLI
@@ -274,6 +292,24 @@ def build_command(region, vpc_id=None, enterprise_project_id=None,
         argv.append("--id.1=%s" % vpc_id)
     if enterprise_project_id:
         argv.append("--enterprise_project_id=%s" % enterprise_project_id)
+    return argv
+
+
+def build_peering_command(region, limit=DEFAULT_PAGE_SIZE, marker=None):
+    """Build the hcloud VPC ListVpcPeerings argv (without the executable).
+
+    Mirrors the real KooCLI parameter list for the read-only ListVpcPeerings
+    operation: --cli-region / --limit / --marker. Paging uses the
+    `next_marker` returned in the response `page_info`.
+    """
+    argv = [
+        SERVICE,
+        PEERING_OPERATION,
+        "--cli-region=%s" % region,
+        "--limit=%d" % limit,
+    ]
+    if marker:
+        argv.append("--marker=%s" % marker)
     return argv
 
 
@@ -320,15 +356,15 @@ def extract_json(stdout):
         raise ApiError("hcloud 输出无法解析为 JSON：%s" % text[:200])
 
 
-def classify_hcloud_failure(stdout, stderr, returncode):
+def classify_hcloud_failure(stdout, stderr, returncode, operation=ALLOWED_OPERATION):
     """Map a failed hcloud invocation to a domain error with explicit hints."""
     blob = (stderr + " " + stdout).strip()
     low = blob.lower()
     if _USE_ERROR_MARKER in low:
         return ApiError(
-            "hcloud 参数错误（KooCLI 拒绝了该参数组合，退出码 %s）：VPC ListVpcs "
-            "真实参数清单可通过 `hcloud VPC ListVpcs --help` 查看。"
-            "详情：%s" % (returncode, blob[:300])
+            "hcloud 参数错误（KooCLI 拒绝了该参数组合，退出码 %s）：VPC %s "
+            "真实参数清单可通过 `hcloud VPC %s --help` 查看。"
+            "详情：%s" % (returncode, operation, operation, blob[:300])
         )
     if any(p in low for p in _CREDENTIAL_MISSING_PATTERNS) and not re.search(
             r"\b40[13]\b", blob):
@@ -358,8 +394,22 @@ def extract_vpcs(payload):
     return []
 
 
+_PEERING_LIST_KEYS = ("peerings", "peering")
+
+
+def extract_peerings(payload):
+    """Pull the VPC peering list out of a ListVpcPeerings response."""
+    if isinstance(payload, list):
+        return payload
+    for key in _PEERING_LIST_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
 def _next_marker(payload):
-    """Read the next_marker from a ListVpcs response page_info."""
+    """Read the next_marker from a ListVpcs / ListVpcPeerings page_info."""
     if not isinstance(payload, dict):
         return None
     page_info = payload.get("page_info") or payload.get("pageInfo")
@@ -413,26 +463,20 @@ def resolve_project_id(explicit=None):
     return _env_value(_PROJECT_ID_ENV_NAMES)
 
 
-def list_vpcs_via_sdk(region, vpc_id=None, enterprise_project_id=None,
-                      limit=DEFAULT_PAGE_SIZE, project_id=None, max_pages=100):
-    """SDK fallback: query VPCs through `huaweicloudsdkvpc` v2.
+def _build_sdk_client(region, project_id, rest_path=REST_PATH):
+    """Build a `huaweicloudsdkvpc` v2 client from whitelisted env credentials.
 
-    Only invoked when hcloud is not installed. Credentials are taken from the
-    whitelisted AK/SK environment variables (HW_*/HUAWEI_ACCESS_KEY family) —
-    never passed as literals here. The official SDK has no env-var
-    auto-discovery on `BasicCredentials()`, so AK/SK (and the project id
-    required by the `/v1/{project_id}/...` path) must be read explicitly.
-    Region resolution uses the SDK's own `VpcRegion` catalog (official
-    endpoints, no guessing), falling back to an explicit `Region(id,
-    endpoint)` for custom regions.
-    `ListVpcsRequest` accepts `id` / `enterprise_project_id` as string values;
-    paging uses `limit` + `marker`.
+    The official SDK has no env-var auto-discovery on `BasicCredentials()`, so
+    AK/SK (and the project id required by the `/v1/{project_id}/...` or
+    `/v2.0/{project_id}/...` path) must be read explicitly. Region resolution
+    uses the SDK's own `VpcRegion` catalog (official endpoints, no guessing),
+    falling back to an explicit `Region(id, endpoint)` for custom regions.
     """
     try:
         from huaweicloudsdkcore.auth.credentials import BasicCredentials
         from huaweicloudsdkcore.region.region import Region
         from huaweicloudsdkcore.http.http_config import HttpConfig
-        from huaweicloudsdkvpc.v2 import VpcClient, ListVpcsRequest
+        from huaweicloudsdkvpc.v2 import VpcClient
         from huaweicloudsdkvpc.v2.region.vpc_region import VpcRegion
     except ImportError as exc:
         raise ConfigError(
@@ -456,7 +500,7 @@ def list_vpcs_via_sdk(region, vpc_id=None, enterprise_project_id=None,
         raise ConfigError(
             "SDK 回退缺少 project_id：VPC 的 REST 路径为 %s，需要项目 ID。"
             "请通过 --project-id 传入，或设置 HUAWEICLOUD_SDK_PROJECT_ID / "
-            "HUAWEI_PROJECT_ID（严禁在对话中粘贴敏感信息）。" % REST_PATH
+            "HUAWEI_PROJECT_ID（严禁在对话中粘贴敏感信息）。" % rest_path
         )
     credentials = BasicCredentials(ak=ak, sk=sk, project_id=resolved_project_id)  # env-sourced, never literals
     try:
@@ -464,7 +508,7 @@ def list_vpcs_via_sdk(region, vpc_id=None, enterprise_project_id=None,
             region_obj = VpcRegion.value_of(region)
         except (ValueError, KeyError, AttributeError):
             region_obj = Region(region, "https://vpc.%s.myhuaweicloud.com" % region)
-        client = VpcClient.new_builder() \
+        return VpcClient.new_builder() \
             .with_credentials(credentials) \
             .with_region(region_obj) \
             .with_http_config(HttpConfig.get_default_config()) \
@@ -474,6 +518,18 @@ def list_vpcs_via_sdk(region, vpc_id=None, enterprise_project_id=None,
             "SDK 初始化失败（region=%s）：%s。请检查 huaweicloudsdkvpc 安装与区域配置。"
             % (region, exc)
         )
+
+
+def list_vpcs_via_sdk(region, vpc_id=None, enterprise_project_id=None,
+                      limit=DEFAULT_PAGE_SIZE, project_id=None, max_pages=100):
+    """SDK fallback: query VPCs through `huaweicloudsdkvpc` v2.
+
+    Only invoked when hcloud is not installed.
+    `ListVpcsRequest` accepts `id` / `enterprise_project_id` as string values;
+    paging uses `limit` + `marker`.
+    """
+    client = _build_sdk_client(region, project_id, REST_PATH)
+    from huaweicloudsdkvpc.v2 import ListVpcsRequest
     vpcs = []
     marker = None
     for _ in range(max_pages):
@@ -542,6 +598,118 @@ def list_vpcs(region, vpc_id=None, enterprise_project_id=None,
     else:
         raise ApiError("翻页超过 %d 页仍未取完，已中止以防死循环。" % max_pages)
     return vpcs
+
+
+def list_peerings_via_sdk(region, limit=DEFAULT_PAGE_SIZE, project_id=None,
+                          max_pages=100):
+    """SDK fallback: query VPC peerings through `huaweicloudsdkvpc` v2.
+
+    Only invoked when hcloud is not installed. Uses `ListVpcPeeringsRequest`
+    (`limit` + `marker`); a typed response has no `page_info`, so a full page
+    continues from the last returned peering id (the marker is a resource id).
+    """
+    client = _build_sdk_client(region, project_id, PEERING_REST_PATH)
+    from huaweicloudsdkvpc.v2 import ListVpcPeeringsRequest
+    peerings = []
+    marker = None
+    for _ in range(max_pages):
+        request = ListVpcPeeringsRequest(limit=limit, marker=marker)
+        try:
+            response = client.list_vpc_peerings(request)
+        except Exception as exc:
+            low = str(exc).lower()
+            if any(p in low for p in _AUTH_PATTERNS):
+                raise AuthError(
+                    "无权限访问虚拟私有云（VPC），请检查 IAM 权限（403）。详情：%s"
+                    % str(exc)[:300]
+                )
+            raise ApiError("SDK 调用失败：%s" % str(exc)[:300])
+        batch = list(getattr(response, "peerings", None) or [])
+        records = [_jsonable(peering.to_dict()) for peering in batch]
+        peerings.extend(records)
+        page_info = getattr(response, "page_info", None)
+        next_marker = getattr(page_info, "next_marker", None) if page_info else None
+        if not next_marker and records and len(records) >= limit:
+            next_marker = records[-1].get("id")
+        if not next_marker or not batch:
+            break
+        marker = str(next_marker)
+    else:
+        raise ApiError("翻页超过 %d 页仍未取完，已中止以防死循环。" % max_pages)
+    return peerings
+
+
+def list_peerings(region, limit=DEFAULT_PAGE_SIZE, project_id=None,
+                  max_pages=100):
+    """Query all VPC peerings (marker-paged); KooCLI first, SDK fallback."""
+    peerings = []
+    marker = None
+    for _page in range(max_pages):
+        argv = build_peering_command(region, limit=limit, marker=marker)
+        try:
+            stdout, stderr, returncode = run_hcloud(argv)
+        except ConfigError:
+            peerings = list_peerings_via_sdk(
+                region, limit=limit, project_id=project_id,
+                max_pages=max_pages,
+            )
+            break
+        if returncode != 0 or _USE_ERROR_MARKER in (stdout + " " + stderr).lower():
+            raise classify_hcloud_failure(
+                stdout, stderr, returncode, operation=PEERING_OPERATION)
+        payload = extract_json(stdout)
+        batch = extract_peerings(payload)
+        peerings.extend(batch)
+        marker = _next_marker(payload)
+        if not marker or not batch or len(batch) < limit:
+            break
+    else:
+        raise ApiError("翻页超过 %d 页仍未取完，已中止以防死循环。" % max_pages)
+    return peerings
+
+
+def normalize_peering(peering):
+    """Flatten a peering record to name / local VPC / peer VPC / status.
+
+    `request_vpc_info.vpc_id` is the local (requesting) VPC and
+    `accept_vpc_info.vpc_id` is the peer (accepting) VPC; either side may be
+    absent in a partial response and is then rendered as `-`.
+    """
+    request_info = peering.get("request_vpc_info")
+    accept_info = peering.get("accept_vpc_info")
+    local_vpc = request_info.get("vpc_id") if isinstance(request_info, dict) else None
+    peer_vpc = accept_info.get("vpc_id") if isinstance(accept_info, dict) else None
+    return {
+        "name": _field(peering, "name", "id"),
+        "local_vpc": local_vpc if local_vpc else "-",
+        "peer_vpc": peer_vpc if peer_vpc else "-",
+        "status": _field(peering, "status"),
+    }
+
+
+def render_peering_table(peerings):
+    """Render the fixed four-column VPC peering table."""
+    rows = [normalize_peering(peering) for peering in peerings]
+    widths = [max(len(col), *(len(str(row[col])) for row in rows))
+              for col in PEERING_TABLE_COLUMNS]
+    lines = [
+        "  ".join(col.ljust(widths[i]) for i, col in enumerate(PEERING_TABLE_COLUMNS)),
+        "  ".join("-" * w for w in widths),
+    ]
+    for row in rows:
+        lines.append("  ".join(str(row[col]).ljust(widths[i])
+                               for i, col in enumerate(PEERING_TABLE_COLUMNS)))
+    return "\n".join(lines)
+
+
+def peering_names(peerings):
+    names = []
+    for peering in peerings:
+        name = _field(peering, "name", default=None)
+        if name is None:
+            name = _field(peering, "id")
+        names.append(str(name))
+    return names
 
 
 def normalize_vpc(vpc):
@@ -694,31 +862,34 @@ def export_markdown(vpcs, output_path, summary=False, region=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="查询华为云虚拟私有云（VPC）列表（KooCLI hcloud VPC ListVpcs，只读）。")
+        description="查询华为云 VPC / VPC 对等连接（只读；KooCLI hcloud VPC ListVpcs / ListVpcPeerings）。")
     parser.add_argument("-r", "--region", default=DEFAULT_REGION,
                         help="目标 Region（默认 %s）" % DEFAULT_REGION)
+    parser.add_argument("--resource", choices=("vpc", "peering"), default="vpc",
+                        help="查询对象：vpc（默认，ListVpcs）或 peering（ListVpcPeerings）")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="以 JSON 输出完整原始字段")
     parser.add_argument("--names-only", action="store_true", dest="names_only",
-                        help="仅输出 VPC 名称清单")
+                        help="仅输出名称清单")
     parser.add_argument("-f", "--format", default=DEFAULT_FORMAT,
                         choices=["table", "json", "names", "md"],
-                        help="输出格式：table（默认）/ json / names / md")
+                        help="输出格式：table（默认）/ json / names / md（md 仅 --resource vpc）")
     parser.add_argument("-o", "--output", default=None,
-                        help="Markdown 输出路径（仅 --format md；默认 "
+                        help="Markdown 输出路径（仅 --format md 且 --resource vpc；默认 "
                              "vpc_list_<region>_<timestamp>.md）")
     parser.add_argument("--summary", action="store_true",
                         help="Markdown 报表末尾追加汇总行（VPC 数量）")
     parser.add_argument("--id", dest="vpc_id",
-                        help="按 VPC ID 过滤（服务端查询参数）")
+                        help="按 VPC ID 过滤（服务端查询参数，仅 --resource vpc）")
     parser.add_argument("--enterprise-project-id", dest="enterprise_project_id",
-                        help="按企业项目 ID 过滤（服务端查询参数，0 表示默认企业项目）")
+                        help="按企业项目 ID 过滤（服务端查询参数，0 表示默认企业项目；仅 --resource vpc）")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
                         dest="page_size", help="分页大小（默认 %d，范围 0~2000）" % DEFAULT_PAGE_SIZE)
     parser.add_argument("--project-id", dest="project_id",
-                        help="项目 ID（可选；SDK 回退在 /v1/{project_id}/vpcs 路径中需要）")
-    parser.add_argument("--operation", default=ALLOWED_OPERATION,
-                        help="hcloud VPC 操作名（仅允许只读 %s）" % ALLOWED_OPERATION)
+                        help="项目 ID（可选；SDK 回退在 /v1/{project_id}/vpcs 或 "
+                             "/v2.0/{project_id}/vpc/peerings 路径中需要）")
+    parser.add_argument("--operation", default=None,
+                        help="hcloud VPC 操作名（缺省随 --resource 选择；仅允许只读 ListVpcs / ListVpcPeerings）")
     raw_argv = argv if argv is not None else sys.argv[1:]
 
     # Write-intent guard runs on the RAW argv BEFORE argparse, so that a
@@ -735,19 +906,38 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        guard_operation(args.operation)
-        if args.vpc_id:
-            guard_write_intent(args.vpc_id)
-        vpcs = list_vpcs(
-            args.region,
-            vpc_id=args.vpc_id,
-            enterprise_project_id=args.enterprise_project_id,
-            limit=args.page_size,
-            project_id=args.project_id,
-        )
+        expected_operation = RESOURCE_OPERATIONS[args.resource]
+        guard_operation(args.operation or expected_operation, allowed=expected_operation)
+        if args.resource == "peering":
+            if args.vpc_id or args.enterprise_project_id:
+                raise VpcListError(
+                    "对等连接查询不支持 --id / --enterprise-project-id 过滤"
+                    "（这两个参数仅用于 --resource vpc）。")
+            if args.format == "md":
+                raise VpcListError(
+                    "Markdown 导出仅支持 --resource vpc"
+                    "（对等连接请使用 table / json / names 输出）。")
+            peerings = list_peerings(
+                args.region,
+                limit=args.page_size,
+                project_id=args.project_id,
+            )
+        else:
+            if args.vpc_id:
+                guard_write_intent(args.vpc_id)
+            vpcs = list_vpcs(
+                args.region,
+                vpc_id=args.vpc_id,
+                enterprise_project_id=args.enterprise_project_id,
+                limit=args.page_size,
+                project_id=args.project_id,
+            )
     except VpcListError as exc:
         print("[错误] %s" % exc, file=sys.stderr)
         return 1
+
+    if args.resource == "peering":
+        return _render_peering_output(args, peerings)
 
     filters = []
     if args.vpc_id:
@@ -789,6 +979,27 @@ def main(argv=None):
 
     print("Region %s 的虚拟私有云（VPC）列表（共 %d 个，完整字段）：" % (args.region, len(vpcs)))
     print(render_table(vpcs))
+    return 0
+
+
+def _render_peering_output(args, peerings):
+    """Render peering results (table / --json / --names-only / empty)."""
+    if args.as_json:
+        print(json.dumps(peerings, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.names_only:
+        print("Region %s 的 VPC 对等连接名称列表（共 %d 个）：" % (args.region, len(peerings)))
+        for name in peering_names(peerings):
+            print("- %s" % name)
+        return 0
+
+    if not peerings:
+        print("当前区域（%s）无对等连接（VPC Peering）。" % args.region)
+        return 0
+
+    print("Region %s 的 VPC 对等连接列表（共 %d 个）：" % (args.region, len(peerings)))
+    print(render_peering_table(peerings))
     return 0
 
 
