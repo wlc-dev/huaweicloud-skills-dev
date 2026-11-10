@@ -18,3 +18,12 @@
 | 14 | Read-only REST path provenance documented | ✅ verification-method.md |
 | 15 | SKILL.md ≤ 500 lines, files ≤ 30, size ≤ 40 MB, extension allowlist | ✅ |
 | 16 | `network/eip` provides the new Network category path | ✅ |
+| 17 | `--markdown` exports a `.md` report with title 「华为云 EIP 列表」, region / generated time / record count, and the full fixed-header table | ✅ `render_markdown` |
+| 18 | `-o/--output <path>` writes to an explicit path (implies Markdown mode); parent directories are created automatically | ✅ `export_markdown` |
+| 19 | Default filename follows `eip_list_<region>_<timestamp>.md` (aligned with the VPC/RDS export skills) | ✅ `default_output_path` |
+| 20 | Missing fields render as `-`; `bandwidth` / `vnic` nested objects are flattened into the report columns | ✅ `normalize_publicip` + `_md_cell` |
+| 21 | Empty result still generates a valid `.md` with a 「无数据」 note and exits 0 | ✅ |
+| 22 | File is written through a temp file + atomic rename; an interrupted write leaves no partial/corrupt `.md` | ✅ |
+| 23 | stdout prints the absolute output path and the record count | ✅ |
+| 24 | Export flags take precedence over `--json` / `--names-only`; without export flags the previous outputs are unchanged | ✅ |
+| 25 | Markdown export unit tests added (empty / default filename / parent-dir creation / atomic write / precedence) | ✅ `tests/test_list_eip.py` |

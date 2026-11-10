@@ -18,6 +18,15 @@ python3 -m unittest discover -s tests -v
   generic / `[USE_ERROR]` with rc=0), marker paging (next_marker / full page /
   empty), SDK fallback (success / missing credentials / missing project id /
   unavailable), rendering, and all main() output modes.
+- Markdown export cases (`TestRenderMarkdown` / `TestExportMarkdown` /
+  `TestMarkdownMain` / `TestGuardTextFromArgv`): full title + metadata +
+  twelve-column header, row values from flattened `bandwidth`/`vnic` fields,
+  `-` fallback for missing fields, empty-result 「无数据」 with exit 0, default
+  `eip_list_<region>_<timestamp>.md` filename, explicit `-o` path, automatic
+  parent-directory creation, atomic write (no leftover temp files), overwrite
+  of an existing report, unusable path raising `ExportError`, export precedence
+  over `--json`/`--names-only`, and the write-intent guard still firing when
+  export flags are combined with a mutating operation.
 
 ## Live verification (when credentials exist)
 
@@ -30,7 +39,25 @@ python3 scripts/list_eip.py --names-only
 python3 scripts/list_eip.py --status ACTIVE                        # server-side filter
 python3 scripts/list_eip.py --id eip-0001
 python3 scripts/list_eip.py --public-ip 1.2.3.4
+
+# Markdown export (default filename + explicit path)
+python3 scripts/list_eip.py --region cn-north-4 --markdown
+python3 scripts/list_eip.py --region cn-north-4 -o /tmp/eip_list.md
+cat /tmp/eip_list.md | head -5                                  # title + metadata + header
+python3 scripts/list_eip.py --status ACTIVE --markdown -o /tmp/eip_active.md
 ```
+
+Markdown export checks performed offline (mocked hcloud, no credentials):
+
+- The report starts with `# 华为云 EIP 列表`, carries
+  `查询区域 / 生成时间 / 记录数`, and a table with the fixed twelve headers.
+- Missing fields render as `-`; nested `bandwidth`/`vnic` data appears in the
+  flat columns.
+- An empty query still writes the file with the 「无数据」 note and exits 0.
+- `-o` creates missing parent directories; writing is atomic (temp file +
+  rename) and leaves no `.tmp` residue.
+- Export flags override `--json` / `--names-only`; without them, outputs are
+  unchanged.
 
 ## API / parameter provenance
 

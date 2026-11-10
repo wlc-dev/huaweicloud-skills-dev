@@ -5,13 +5,15 @@ Primary execution path is KooCLI (`hcloud EIP ListPublicips`, read-only
 GET /v3/{project_id}/eip/publicips); when hcloud is not installed the script
 falls back to the official `huaweicloudsdkeip` v3 SDK
 (`EipClient.list_publicips`). Reads nothing but the active credential profile /
-environment. Supports three output modes (table / --json / --names-only),
---id / --status / --public-ip filters (all real server-side query parameters),
-marker-based paging, and a strict write-intent guard: any argument that looks
-like a mutating EIP operation is rejected before a single command is executed.
+environment. Supports four output modes (table / --json / --names-only /
+Markdown export), --id / --status / --public-ip filters (all real server-side
+query parameters), marker-based paging, and a strict write-intent guard: any
+argument that looks like a mutating EIP operation is rejected before a single
+command is executed.
 
 Usage:
     python3 scripts/list_eip.py [--region cn-north-4] [--json | --names-only]
+                                [--markdown] [-o/--output <path.md>]
                                 [--id eip-0001] [--status ACTIVE]
                                 [--public-ip 1.2.3.4] [--page-size 100]
                                 [--project-id <id>] [--operation ListPublicips]
@@ -25,14 +27,40 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 
 DEFAULT_REGION = "cn-north-4"
 DEFAULT_PAGE_SIZE = 100
 SERVICE = "EIP"
 ALLOWED_OPERATION = "ListPublicips"
 REST_PATH = "/v3/{project_id}/eip/publicips"
+
+# Markdown export defaults (naming aligned with the VPC/RDS export skills).
+DEFAULT_FILENAME_PREFIX = "eip_list"
+MD_TITLE = "华为云 EIP 列表"
+MD_COLUMNS = (
+    ("公网IP", ("public_ip_address", "public_ipv6_address")),
+    ("EIP ID", ("id",)),
+    ("别名", ("alias",)),
+    ("状态", ("status",)),
+    ("类型", ("type",)),
+    ("绑定实例类型", ("associate_instance_type",)),
+    ("绑定实例 ID", ("associate_instance_id",)),
+    ("带宽名称", ("bandwidth_name",)),
+    ("带宽大小", ("bandwidth_size",)),
+    ("计费方式", ("bandwidth_charge_mode",)),
+    ("企业项目 ID", ("enterprise_project_id",)),
+    ("创建时间", ("created_at",)),
+)
+
+# Local-output flags whose *values* are pure file paths (e.g. a report named
+# "eip-release-report.md"). Their values are not cloud-operation intents and
+# must not be scanned by the write-intent guard.
+_VALUE_STRIPPED_FLAGS = ("--output", "-o")
 
 # Mutating EIP operations / intents — strictly rejected by the guard.
 WRITE_INTENT_KEYWORDS = (
@@ -151,6 +179,36 @@ class ApiError(EipListError):
     """hcloud / network / unexpected API failure."""
 
 
+class ExportError(EipListError):
+    """The local Markdown file could not be created or written."""
+
+
+def guard_text_from_argv(argv):
+    """Build the text the write-intent guard should scan.
+
+    Flag names and positional tokens are scanned; only the values of the local
+    output flags (``--output`` / ``-o``) are stripped, because they are file
+    paths that may legitimately contain write-looking words (e.g.
+    ``eip-release-report.md``). A following flag is never swallowed: a token
+    starting with ``-`` is still scanned.
+    """
+    tokens = list(argv if argv is not None else sys.argv[1:])
+    kept = []
+    skip_next = False
+    for tok in tokens:
+        if tok in _VALUE_STRIPPED_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-") and "=" in tok and tok.split("=", 1)[0] in _VALUE_STRIPPED_FLAGS:
+            continue
+        if skip_next:
+            skip_next = False
+            if not tok.startswith("-"):
+                continue
+        kept.append(tok)
+    return " ".join(kept)
+
+
 def guard_write_intent(text):
     """Raise GuardError if `text` carries a mutating intent.
 
@@ -186,6 +244,12 @@ def build_command(region, eip_id=None, status=None, public_ip=None,
     operation: --cli-region / --limit / --marker and the real server-side
     filters --id / --status / --public_ip_address. EIP pages with
     `limit` + `marker` (the next_marker comes from the response page_info).
+
+    `--id` / `--status` / `--public_ip_address` are **array** parameters in
+    KooCLI (`array<string>`, format `--xxx.1=value1 ...`). Passing them as
+    scalars makes KooCLI 7.x reject the request with
+    `[USE_ERROR]Invalid parameter: ...`, so they must always use the `.1`
+    array index.
     """
     argv = [
         SERVICE,
@@ -196,11 +260,11 @@ def build_command(region, eip_id=None, status=None, public_ip=None,
     if marker:
         argv.append("--marker=%s" % marker)
     if eip_id:
-        argv.append("--id=%s" % eip_id)
+        argv.append("--id.1=%s" % eip_id)
     if status:
-        argv.append("--status=%s" % status)
+        argv.append("--status.1=%s" % status)
     if public_ip:
-        argv.append("--public_ip_address=%s" % public_ip)
+        argv.append("--public_ip_address.1=%s" % public_ip)
     return argv
 
 
@@ -530,6 +594,120 @@ def render_table(publicips):
     return "\n".join(lines)
 
 
+def _md_cell(value):
+    """Render one Markdown table cell; pipes/newlines are escaped, ``-`` is the fallback."""
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = str(value).replace("\r\n", " ").replace("\n", " ")
+    text = text.replace("\r", " ").replace("|", "\\|")
+    return text or "-"
+
+
+def _generated_at():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def active_filter_descriptions(status=None, eip_id=None, public_ip=None):
+    """Human-readable description of the server-side filters actually applied."""
+    filters = []
+    if status:
+        filters.append("status=%s" % status)
+    if eip_id:
+        filters.append("id=%s" % eip_id)
+    if public_ip:
+        filters.append("public_ip=%s" % public_ip)
+    return filters
+
+
+def render_markdown(publicips, region=None, generated_at=None,
+                    filters=None):
+    """Render the EIP list as a Markdown document (title + metadata + table).
+
+    The table always carries the full fixed header set, so downstream readers
+    get a stable schema. An empty list still renders a valid document with an
+    explicit 「无数据」 note — never a corrupt or missing report.
+    """
+    publicips = list(publicips)
+    rows_data = [normalize_publicip(publicip) for publicip in publicips]
+    generated_at = generated_at or _generated_at()
+    region_label = region or "-"
+
+    lines = [
+        "# %s" % MD_TITLE,
+        "",
+        "> 查询区域：%s | 生成时间：%s | 记录数：%d"
+        % (region_label, generated_at, len(rows_data)),
+    ]
+    if filters:
+        lines.append("> 过滤条件：%s" % ", ".join(filters))
+    lines += ["", "| " + " | ".join(label for label, _ in MD_COLUMNS) + " |",
+              "| " + " | ".join(["---"] * len(MD_COLUMNS)) + " |"]
+    for publicip in rows_data:
+        cells = [_md_cell(_field(publicip, *keys)) for _, keys in MD_COLUMNS]
+        lines.append("| " + " | ".join(cells) + " |")
+    if not rows_data:
+        lines += ["", "当前区域（%s）无弹性公网IP（EIP）数据，无数据。" % region_label]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def default_output_path(region):
+    """Default .md filename: eip_list_<region>_<timestamp>.md"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return "%s_%s_%s.md" % (DEFAULT_FILENAME_PREFIX, region, stamp)
+
+
+def export_markdown(publicips, output_path, region=None, generated_at=None,
+                    filters=None):
+    """Write the EIP list as a Markdown report at ``output_path``.
+
+    Missing parent directories are created; the file is staged through a temp
+    file in the same directory and atomically renamed, so an interrupted write
+    never leaves a partial/corrupt report behind.
+
+    Returns the absolute path of the written file.
+    Raises ExportError when the directory/file cannot be created or written.
+    """
+    publicips = list(publicips)
+    output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.isdir(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            raise ExportError(
+                "无法创建输出目录 %r：%s。请检查 --output 路径。"
+                % (output_dir, exc)
+            )
+
+    text = render_markdown(publicips, region=region,
+                          generated_at=generated_at, filters=filters)
+
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".%s." % DEFAULT_FILENAME_PREFIX, suffix=".tmp",
+            dir=output_dir or ".")
+        os.close(fd)
+    except (OSError, ValueError) as exc:
+        raise ExportError("Markdown 临时文件创建失败：%s（%s）"
+                          % (output_path, exc))
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        shutil.move(tmp_path, output_path)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise ExportError("Markdown 文件写出失败：%s（%s）"
+                          % (output_path, exc))
+    return output_path
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="查询华为云弹性公网IP（EIP）列表（KooCLI hcloud EIP ListPublicips，只读）。")
@@ -539,6 +717,12 @@ def main(argv=None):
                         help="以 JSON 输出完整原始字段")
     parser.add_argument("--names-only", action="store_true", dest="names_only",
                         help="仅输出 EIP 名称 / 公网IP 清单")
+    parser.add_argument("--markdown", action="store_true", dest="markdown",
+                        help="导出 Markdown 报表（默认文件名 %s_<region>_<timestamp>.md）"
+                             % DEFAULT_FILENAME_PREFIX)
+    parser.add_argument("-o", "--output", dest="output", default=None,
+                        help="Markdown 输出路径（隐含 --markdown；缺省为 "
+                             "%s_<region>_<timestamp>.md）" % DEFAULT_FILENAME_PREFIX)
     parser.add_argument("--id", dest="eip_id",
                         help="按 EIP ID 过滤（服务端查询参数）")
     parser.add_argument("--status", help="按 EIP 状态过滤（如 ACTIVE / DOWN / ERROR，服务端查询参数）")
@@ -553,8 +737,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     try:
-        # Write-intent guard: scan the raw argv + validate the operation name.
-        guard_write_intent(" ".join(argv if argv is not None else sys.argv[1:]))
+        # Write-intent guard: scan the raw argv (local output paths excluded)
+        # + validate the operation name.
+        guard_write_intent(guard_text_from_argv(argv))
         guard_operation(args.operation)
         if args.eip_id:
             guard_write_intent(args.eip_id)
@@ -571,6 +756,27 @@ def main(argv=None):
     except EipListError as exc:
         print("[错误] %s" % exc, file=sys.stderr)
         return 1
+
+    # Markdown export takes precedence over --json / --names-only.
+    if args.markdown or args.output:
+        output_path = args.output or default_output_path(args.region)
+        filters = active_filter_descriptions(
+            status=args.status, eip_id=args.eip_id, public_ip=args.public_ip)
+        try:
+            written = export_markdown(publicips, output_path, region=args.region,
+                                      filters=filters)
+        except EipListError as exc:
+            print("[错误] %s" % exc, file=sys.stderr)
+            return 1
+        filters_suffix = "（过滤条件: %s）" % ", ".join(filters) if filters else ""
+        if publicips:
+            print("已生成 EIP 列表 Markdown 报表（Region %s，共 %d 条记录）：%s"
+                  % (args.region, len(publicips), written))
+        else:
+            print("当前区域（%s）无弹性公网IP（EIP）数据%s，已生成 Markdown 文件"
+                  "（标注「无数据」，共 0 条）：%s"
+                  % (args.region, filters_suffix, written))
+        return 0
 
     if args.as_json:
         print(json.dumps(publicips, ensure_ascii=False, indent=2))

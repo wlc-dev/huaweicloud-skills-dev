@@ -1,7 +1,9 @@
+import glob
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -12,19 +14,24 @@ from list_eip import (  # noqa: E402
     ApiError,
     AuthError,
     ConfigError,
+    ExportError,
     GuardError,
     EipListError,
     build_command,
     classify_hcloud_failure,
+    default_output_path,
+    export_markdown,
     extract_json,
     extract_publicips,
     guard_operation,
+    guard_text_from_argv,
     guard_write_intent,
     list_publicips,
     list_publicips_via_sdk,
     main,
     normalize_publicip,
     publicip_names,
+    render_markdown,
     render_table,
 )
 
@@ -144,10 +151,23 @@ class TestBuildCommand(unittest.TestCase):
     def test_filters_forwarded_server_side(self):
         argv = build_command("cn-south-1", eip_id="eip-9", status="ACTIVE",
                              public_ip="1.2.3.4", limit=10)
-        self.assertIn("--id=eip-9", argv)
-        self.assertIn("--status=ACTIVE", argv)
-        self.assertIn("--public_ip_address=1.2.3.4", argv)
+        self.assertIn("--id.1=eip-9", argv)
+        self.assertIn("--status.1=ACTIVE", argv)
+        self.assertIn("--public_ip_address.1=1.2.3.4", argv)
         self.assertIn("--limit=10", argv)
+
+    def test_filters_use_koocli_array_syntax(self):
+        # Regression: EIP ListPublicips declares id/status/public_ip_address as
+        # array<string> params in KooCLI 7.x — the scalar form is rejected with
+        # [USE_ERROR]Invalid parameter, so every filter must carry the `.1` index.
+        argv = build_command("cn-north-4", eip_id="eip-9", status="ACTIVE",
+                             public_ip="1.2.3.4")
+        self.assertIn("--id.1=eip-9", argv)
+        self.assertIn("--status.1=ACTIVE", argv)
+        self.assertIn("--public_ip_address.1=1.2.3.4", argv)
+        for scalar in ("--id=eip-9", "--status=ACTIVE",
+                       "--public_ip_address=1.2.3.4"):
+            self.assertNotIn(scalar, argv)
 
     def test_no_write_flags_ever_added(self):
         argv = build_command("cn-north-4", status="ACTIVE")
@@ -248,9 +268,9 @@ class TestListPublicips(unittest.TestCase):
             list_publicips("cn-north-4", status="ACTIVE", eip_id="eip-0001",
                            public_ip="1.2.3.4")
         call = fake.calls[0]
-        self.assertTrue(any("--status=ACTIVE" in part for part in call))
-        self.assertTrue(any("--id=eip-0001" in part for part in call))
-        self.assertTrue(any("--public_ip_address=1.2.3.4" in part for part in call))
+        self.assertTrue(any("--status.1=ACTIVE" in part for part in call))
+        self.assertTrue(any("--id.1=eip-0001" in part for part in call))
+        self.assertTrue(any("--public_ip_address.1=1.2.3.4" in part for part in call))
 
     def test_use_error_rc0_raises_api_error(self):
         fake = FakeRunner([(
@@ -558,7 +578,7 @@ class TestMain(unittest.TestCase):
                 mock.patch("sys.stderr"):
             rc = main(["--status", "ACTIVE"])
         self.assertEqual(rc, 0)
-        self.assertTrue(any("--status=ACTIVE" in part for part in fake.calls[0]))
+        self.assertTrue(any("--status.1=ACTIVE" in part for part in fake.calls[0]))
 
     def test_empty_json_output(self):
         rc, out, err = self._run(
@@ -624,9 +644,204 @@ class TestMain(unittest.TestCase):
         self.assertIn("写操作意图", err)
 
 
+class TestRenderMarkdown(unittest.TestCase):
+    def test_title_metadata_and_full_header(self):
+        md = render_markdown([PUBLICIP_1, PUBLICIP_2], region="cn-north-4",
+                             generated_at="2026-11-10T00:00:00Z")
+        self.assertIn("# 华为云 EIP 列表", md)
+        self.assertIn("查询区域：cn-north-4", md)
+        self.assertIn("生成时间：2026-11-10T00:00:00Z", md)
+        self.assertIn("记录数：2", md)
+        for header in ("公网IP", "EIP ID", "别名", "状态", "类型",
+                       "绑定实例类型", "绑定实例 ID", "带宽名称", "带宽大小",
+                       "计费方式", "企业项目 ID", "创建时间"):
+            self.assertIn("| %s |" % header, md)
+
+    def test_rows_and_flat_bandwidth_fields(self):
+        md = render_markdown([PUBLICIP_1], region="cn-north-4",
+                             generated_at="2026-11-10T00:00:00Z")
+        for fragment in ("1.2.3.4", "eip-0001", "eip-demo-01", "ACTIVE",
+                         "PORT", "port-0001", "bw-demo", "5", "traffic", "0",
+                         "2024-01-01T00:00:00"):
+            self.assertIn(fragment, md)
+
+    def test_missing_fields_use_dash(self):
+        md = render_markdown([{"id": "eip-9", "public_ip_address": "9.9.9.9"}],
+                             region="cn-north-4")
+        row = [line for line in md.splitlines() if "| eip-9 |" in line][0]
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        self.assertTrue(all(cell for cell in cells))
+        self.assertGreaterEqual(cells.count("-"), 10)
+
+    def test_empty_list_still_valid_with_no_data_note(self):
+        md = render_markdown([], region="cn-south-1",
+                             generated_at="2026-11-10T00:00:00Z")
+        self.assertIn("# 华为云 EIP 列表", md)
+        self.assertIn("记录数：0", md)
+        self.assertIn("| 公网IP |", md)
+        self.assertIn("无数据", md)
+
+    def test_filters_rendered(self):
+        md = render_markdown([], region="cn-north-4",
+                             filters=["status=ACTIVE", "id=eip-1"])
+        self.assertIn("过滤条件：status=ACTIVE, id=eip-1", md)
+
+
+class TestExportMarkdown(unittest.TestCase):
+    def test_creates_parent_directories_and_returns_abspath(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "nested", "reports", "eip.md")
+            written = export_markdown([PUBLICIP_1], target,
+                                      region="cn-north-4")
+            self.assertEqual(written, os.path.abspath(target))
+            self.assertTrue(os.path.isfile(written))
+            with open(written, encoding="utf-8") as handle:
+                self.assertIn("eip-demo-01", handle.read())
+
+    def test_atomic_write_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "eip.md")
+            export_markdown([PUBLICIP_1, PUBLICIP_2], target,
+                            region="cn-north-4")
+            self.assertEqual(sorted(os.listdir(tmp)), ["eip.md"])
+
+    def test_overwrites_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "eip.md")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("stale")
+            export_markdown([PUBLICIP_1], target, region="cn-north-4")
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertNotIn("stale", content)
+            self.assertIn("eip-0001", content)
+
+    def test_empty_list_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "empty.md")
+            export_markdown([], target, region="cn-south-1")
+            with open(target, encoding="utf-8") as handle:
+                content = handle.read()
+            self.assertIn("无数据", content)
+
+    def test_unwritable_parent_raises_export_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "not-a-dir")
+            with open(blocker, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            with self.assertRaises(ExportError):
+                export_markdown([], os.path.join(blocker, "eip.md"))
+
+    def test_default_output_path_shape(self):
+        name = default_output_path("cn-north-4")
+        self.assertTrue(name.startswith("eip_list_cn-north-4_"))
+        self.assertTrue(name.endswith(".md"))
+
+
+class TestMarkdownMain(unittest.TestCase):
+    def _run(self, argv, results):
+        fake = FakeRunner(results)
+        with mock.patch("list_eip.subprocess.run", fake), \
+                mock.patch("sys.stdout") as stdout, \
+                mock.patch("sys.stderr") as stderr:
+            rc = main(argv)
+        out = "".join(c[0][0] for c in stdout.write.call_args_list)
+        err = "".join(c[0][0] for c in stderr.write.call_args_list)
+        return rc, out, err
+
+    def test_output_flag_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "eip.md")
+            rc, out, err = self._run(
+                ["-o", target],
+                [(json.dumps({"publicips": [PUBLICIP_1]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(target))
+            self.assertIn(os.path.abspath(target), out)
+            self.assertIn("共 1 条", out)
+            with open(target, encoding="utf-8") as handle:
+                self.assertIn("eip-demo-01", handle.read())
+
+    def test_markdown_flag_uses_default_filename_in_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                rc, out, err = self._run(
+                    ["--markdown", "--region", "cn-north-4"],
+                    [(json.dumps({"publicips": [PUBLICIP_1]}), "", 0)])
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            files = glob.glob(os.path.join(tmp, "eip_list_cn-north-4_*.md"))
+            self.assertEqual(len(files), 1)
+            self.assertIn(os.path.abspath(files[0]), out)
+
+    def test_empty_result_still_writes_markdown_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "empty.md")
+            rc, out, err = self._run(
+                ["--markdown", "-o", target, "--region", "cn-south-1"],
+                [(json.dumps({"publicips": []}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(target))
+            self.assertIn("无数据", out)
+            self.assertIn("共 0 条", out)
+            with open(target, encoding="utf-8") as handle:
+                self.assertIn("无数据", handle.read())
+
+    def test_export_precedence_over_json_and_names_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "eip.md")
+            rc, out, err = self._run(
+                ["--json", "--names-only", "--markdown", "-o", target],
+                [(json.dumps({"publicips": [PUBLICIP_1]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(target))
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(out)
+
+    def test_output_path_containing_write_word_is_not_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "eip-release-report.md")
+            rc, out, err = self._run(
+                ["-o", target],
+                [(json.dumps({"publicips": [PUBLICIP_1]}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(target))
+
+    def test_write_flags_still_blocked_with_export_args(self):
+        rc, out, err = self._run(["--markdown", "--operation", "DeletePublicip"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("写操作意图", err)
+
+
+class TestGuardTextFromArgv(unittest.TestCase):
+    def test_output_value_stripped(self):
+        text = guard_text_from_argv(["-o", "eip-release-report.md"])
+        self.assertNotIn("release", text)
+        self.assertEqual(text, "")
+
+    def test_output_equals_form_stripped(self):
+        self.assertNotIn("delete", guard_text_from_argv(
+            ["--output=delete-report.md"]))
+
+    def test_other_values_still_scanned(self):
+        self.assertIn("release-me", guard_text_from_argv(["--id", "release-me"]))
+
+    def test_following_flag_not_swallowed(self):
+        text = guard_text_from_argv(["-o", "--create-eip"])
+        self.assertIn("--create-eip", text)
+
+
 class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
-        for exc in (GuardError, ConfigError, AuthError, ApiError):
+        for exc in (GuardError, ConfigError, AuthError, ApiError, ExportError):
             self.assertTrue(issubclass(exc, EipListError))
 
 
