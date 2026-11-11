@@ -1,5 +1,7 @@
 # Skill Development Specification & Guide (Generic v1)
 
+> **Note**: this reference is inherited from the `huawei-cloud-skill-creator` toolchain. The `scripts/validate-skill.sh` / `scripts/test-cli-commands.sh` / `scripts/generate-dataflow-diagram.sh` commands below are provided by that skill and are run from its directory, not from `huawei-cloud-find-skills` (whose only script is `scripts/search-skills.py` plus `scripts/install_cli.sh`).
+
 > v1.0.0 | Synthesized from Codex Skill Creator, Community Skill Creator, Feishu lark-skill-maker, and Huawei Cloud Skills specifications.
 
 ---

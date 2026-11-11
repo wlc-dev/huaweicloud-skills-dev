@@ -1,0 +1,8 @@
+{
+  "skill_name": "huawei-cloud-find-skills",
+  "region": "cn-north-4",
+  "test_cases": [],
+  "env_vars_required": [],
+  "optional_vars": [],
+  "notes": "本 skill 只做技能索引检索与安装指导，不调用任何 hcloud 云服务接口，因此没有可执行的 CLI 用例。离线回归用例见 scripts/test_search_skills.py（python3 -m unittest，标准库 + fixture 索引，覆盖 CCE 覆盖标注/分组、排名、缺 services/type 回退、无结果提示与 -c 类目过滤）。真实检索与安装交由 QA 带外验证。"
+}

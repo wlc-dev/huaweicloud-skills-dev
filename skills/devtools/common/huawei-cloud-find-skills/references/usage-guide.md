@@ -1,5 +1,7 @@
 # Usage Guide — Huawei Cloud Skill Creator
 
+> **Note**: this reference is inherited from the `huawei-cloud-skill-creator` toolchain. The `scripts/validate-skill.sh` / `scripts/test-cli-commands.sh` / `scripts/generate-dataflow-diagram.sh` commands below are provided by that skill and are run from its directory, not from `huawei-cloud-find-skills` (whose only script is `scripts/search-skills.py` plus `scripts/install_cli.sh`).
+
 Detailed 11-step workflow for creating a Huawei Cloud AI Shell Skill.
 
 ---

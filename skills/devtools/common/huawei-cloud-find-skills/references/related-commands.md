@@ -1,5 +1,7 @@
 # Related Commands Quick Reference - huawei-cloud-skill-creator-skill
 
+> **Note**: this reference is inherited from the `huawei-cloud-skill-creator` toolchain. The `scripts/validate-skill.sh` / `scripts/test-cli-commands.sh` / `scripts/generate-dataflow-diagram.sh` commands below are provided by that skill and are run from its directory, not from `huawei-cloud-find-skills` (whose only script is `scripts/search-skills.py` plus `scripts/install_cli.sh`).
+
 > Read this file when you need to quickly look up Skill creation related commands.
 
 ## hcloud CLI General Commands

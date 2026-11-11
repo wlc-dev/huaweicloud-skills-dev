@@ -1,5 +1,7 @@
 # Verification Method - huawei-cloud-skill-creator-skill
 
+> **Note**: this reference is inherited from the `huawei-cloud-skill-creator` toolchain. The `scripts/validate-skill.sh` / `scripts/test-cli-commands.sh` / `scripts/generate-dataflow-diagram.sh` commands below are provided by that skill and are run from its directory, not from `huawei-cloud-find-skills` (whose only script is `scripts/search-skills.py` plus `scripts/install_cli.sh`).
+
 > Read this file when verifying that a generated Skill complies with the specification.
 
 ## Automated Verification
