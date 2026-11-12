@@ -38,32 +38,56 @@ CONFIG_GUIDANCE = (
 
 
 def _translate_cli_error(raw):
-    """Map common obsutil CLI error patterns to clear Chinese hints."""
+    """把 obsutil / KooCLI 的常见报错文本翻译成清晰的中文提示。
+
+    用途：
+        解析 CLI 执行失败时捕获到的原始输出，命中已知错误特征时返回对应的
+        中文排查提示，便于用户直接定位问题（桶名 / 凭证 / 权限 / 安装）。
+
+    入参：
+        raw：CLI 进程的原始输出或报错文本（stdout/stderr 合并后的字符串），
+            可能为空（None 或空串）。
+
+    匹配方式：
+        先对 raw 调用 lower() 统一转小写，再做**大小写不敏感的子串匹配**，
+        因此上游错误码（如 NoSuchBucket）与大小写变体都能命中。
+
+    返回值：
+        命中任一分支 → 返回该分支对应的中文提示字符串；
+        全部未命中   → 返回 None，表示无法识别，由调用方按原始错误输出处理。
+    """
     lower = (raw or "").lower()
+    # 分支 1：桶不存在（NoSuchBucket / bucket does not exist），也可能是 AK/SK 无权访问导致
     if "nosuchbucket" in lower or "bucket does not exist" in lower:
         return (
             "错误：指定的 OBS 桶不存在，或当前 AK/SK 无权访问该桶（NoSuchBucket）。\n"
             "请检查桶名是否正确，以及 IAM 权限是否包含 obs:bucket:ListBucket / obs:object:List。"
         )
+    # 分支 2：AK/SK 无效或已过期（InvalidAccessKeyId）
     if "invalidaccesskeyid" in lower:
         return (
             "错误：AK/SK 无效或已过期（InvalidAccessKeyId）。\n"
             "请检查 obsutil 配置中的 AK/SK 是否正确：hcloud obs config -i=<YourAK> -k=<YourSK> -e=obs.<Region>.myhuaweicloud.com"
         )
+    # 分支 3：请求签名校验失败（SignatureDoesNotMatch；同时兜住仅含 signature 关键字的变体）
     if "signaturedoesnotmatch" in lower or "signature" in lower:
         return "错误：请求签名校验失败，请核对 AK/SK 与端点配置是否正确。"
+    # 分支 4：访问被拒绝（AccessDenied / forbidden / HTTP 403），通常为 IAM 权限不足
     if "accessdenied" in lower or "forbidden" in lower or "403" in lower:
         return (
             "错误：访问被拒绝（AccessDenied）。当前 AK/SK 无权限读取该桶，\n"
             "请检查 IAM 策略是否包含 obs:bucket:ListBucket / obs:object:List。"
         )
+    # 分支 5：未配置 obsutil 凭证（提示需设置 AK/SK 与 endpoint，或缺少配置文件）
     if "please set ak, sk and endpoint" in lower or "configure the ak, sk and endpoint" in lower or "configuration file" in lower:
         return "错误：未检测到 obsutil 凭证配置。\n" + CONFIG_GUIDANCE
+    # 分支 6：hcloud (KooCLI) 命令不存在，通常为未安装或未加入 PATH
     if "command not found" in lower or "not found: hcloud" in lower or "hcloud: command not found" in lower:
         return (
             "错误：未找到 hcloud (KooCLI) 命令。\n"
             "请先安装 KooCLI，安装说明见 SKILL.md 的 references/cli-installation-guide.md。"
         )
+    # 兜底：未命中任何已知错误特征，返回 None 交由调用方展示原始错误
     return None
 
 
