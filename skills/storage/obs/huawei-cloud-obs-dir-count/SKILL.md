@@ -19,7 +19,6 @@ tags:
   - directory
   - count
   - query
-  - inventory
 ---
 
 # Huawei Cloud OBS Directory Count Skill

@@ -12,13 +12,23 @@ skip=0
 
 SCRIPT="$SKILL_PATH/scripts/count_obs_directories.py"
 
+# run_test — execute a single smoke-test case and tally its result.
+#   $1 id   — test case identifier (e.g. TC-01)
+#   $2 name — human-readable test case name
+#   $3 cmd  — shell command to run for this case
 run_test() {
     local id="$1" name="$2" cmd="$3"
     echo -n "  [$id] $name ... "
+    # Run the case in a subshell, capturing both stdout and stderr into
+    # `output`; the exit status decides whether the case passed.
     if output=$(bash -c "$cmd" 2>&1); then
+        # Success: print PASS and bump the pass counter.
         echo "PASS"
         pass=$((pass + 1))
     else
+        # Failure: print FAIL plus the captured output for diagnosis, then
+        # bump the fail counter. Both counters feed the "Results" summary at
+        # the end of the script, which exits 1 when fail > 0.
         echo "FAIL"
         echo "    Error: $output"
         fail=$((fail + 1))
