@@ -18,8 +18,13 @@ Usage:
                                    [--project_id <project_id>]
                                    [--output rds_instances.md]
                                    [--name rds-01] [--status ACTIVE]
+                                   [--sort-by name|created]
                                    [--page-size 100] [--operation ListInstances]
                                    [--stdout]
+
+`--sort-by` orders the exported rows locally after the full (paged) list has
+been fetched — the real RDS ListInstances API has no ordering parameter. Omit
+it to keep the API order (byte-identical output to the previous behaviour).
 
 Environment overrides (mostly for tests):
     RDS_LIST_MD_HCLOUD_BIN   hcloud executable (default "hcloud")
@@ -27,6 +32,7 @@ Environment overrides (mostly for tests):
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -75,8 +81,11 @@ WRITE_INTENT_KEYWORDS = (
     "destroy",
 )
 
-# Values of these read-only flags are caller data (filters, local output paths),
-# not RDS operations — they are excluded from the mutating-intent scan.
+# Values of these read-only flags are caller data (filters, local output paths,
+# local ordering options), not RDS operations — they are excluded from the
+# mutating-intent scan. `--sort-by` MUST stay in this set: its value "created"
+# contains the mutating keyword "create", so scanning it would reject a
+# perfectly read-only export.
 READ_ONLY_VALUE_FLAGS = frozenset((
     "--output", "-o",
     "--region", "-r",
@@ -88,7 +97,12 @@ READ_ONLY_VALUE_FLAGS = frozenset((
     "--page-size",
     "--limit",
     "--offset",
+    "--sort-by",
 ))
+
+# Locally supported `--sort-by` values. The real ListInstances API has no
+# ordering parameter, so ordering is always applied client-side.
+SORTABLE_KEYS = ("name", "created")
 
 _INSTANCE_LIST_KEYS = ("instances", "instance_list", "instanceInfos")
 
@@ -180,6 +194,10 @@ class ApiError(RdsListError):
     """hcloud / network / unexpected API / file export failure."""
 
 
+class SortError(RdsListError):
+    """The requested `--sort-by` value is not supported."""
+
+
 def guard_write_intent(text):
     """Raise GuardError if `text` carries a mutating intent.
 
@@ -212,8 +230,9 @@ def scrub_read_only_values(argv):
 
     Values such as the local `--output` path or a `--name` filter are caller
     data, not RDS operations; scanning them would cause false positives (e.g. a
-    file named under `downloads/`). The flag itself and every other token are
-    kept and still scanned.
+    file named under `downloads/`, or `--sort-by created` whose value contains
+    the keyword `create`). Both `--flag value` and `--flag=value` forms are
+    scrubbed; the flag itself and every other token are kept and still scanned.
     """
     out = []
     skip_next = False
@@ -221,9 +240,16 @@ def scrub_read_only_values(argv):
         if skip_next:
             skip_next = False
             continue
-        out.append(token)
         if token in READ_ONLY_VALUE_FLAGS:
+            out.append(token)
             skip_next = True
+            continue
+        for flag in READ_ONLY_VALUE_FLAGS:
+            if token.startswith(flag + "="):
+                out.append(flag)
+                break
+        else:
+            out.append(token)
     return " ".join(out)
 
 
@@ -367,6 +393,108 @@ def filter_by_status(instances, status):
         if value is not None and str(value).strip().lower() == wanted:
             matched.append(instance)
     return matched
+
+
+def resolve_sort_by(sort_by):
+    """Normalize and validate a `--sort-by` value (None when omitted).
+
+    Values are matched case-insensitively; anything other than `name` /
+    `created` raises `SortError` so `main()` can fail fast with exit code 1
+    (argparse `choices` would exit with 2 and break the skill's error contract).
+    """
+    if sort_by is None:
+        return None
+    value = str(sort_by).strip().lower()
+    if not value:
+        return None
+    if value not in SORTABLE_KEYS:
+        raise SortError("--sort-by 仅支持 name 或 created（收到: %s）" % sort_by)
+    return value
+
+
+def parse_created(value):
+    """Parse an instance `created` timestamp into an aware UTC datetime.
+
+    Huawei Cloud returns several ISO-8601 variants: `2026-01-02T03:04:05Z`,
+    `2026-01-02T03:04:05+0800`, and space-separated `2026-01-02 03:04:05`.
+    Naive values (no timezone) are treated as UTC so that aware and naive
+    timestamps remain comparable — mixing them directly raises `TypeError`.
+    Returns None for missing / unparseable values.
+    """
+    text = str(value).strip()
+    if not text:
+        return None
+    candidate = text
+    if candidate[-1:] in ("Z", "z"):
+        candidate = candidate[:-1] + "+00:00"
+    if " " in candidate:
+        candidate = candidate.replace(" ", "T", 1)
+    # Python < 3.11 rejects the compact ±HHMM offset form, so normalize it to
+    # ±HH:MM (keeps sorted order correct on the skill's minimum Python 3.8).
+    compact_offset = re.search(r"([+-]\d{2})(\d{2})$", candidate)
+    if compact_offset:
+        candidate = "%s%s:%s" % (candidate[:compact_offset.start()],
+                                 compact_offset.group(1),
+                                 compact_offset.group(2))
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _sort_value(instance, sort_by):
+    """Return (usable, comparable) for one instance under `sort_by`.
+
+    `usable=False` marks a missing key; such records are always placed last.
+    `created` values whose text cannot be parsed fall back to lowercased text
+    comparison (flagged by the tuple's first element so a float and a string
+    are never compared directly).
+    """
+    if not isinstance(instance, dict):
+        return False, None
+    if sort_by == "name":
+        value = _field(instance, "name", "instance_name", default=None)
+        if value is None:
+            value = _field(instance, "id", "instance_id", default=None)
+        if value is None:
+            return False, None
+        text = str(value).strip()
+        if not text:
+            return False, None
+        return True, text.lower()
+    raw = _field(instance, "created", default=None)
+    if raw is None:
+        return False, None
+    text = str(raw).strip()
+    if not text or text == "-":
+        return False, None
+    parsed = parse_created(text)
+    if parsed is None:
+        return True, (1, text.lower())
+    return True, (0, parsed.timestamp())
+
+
+def sort_instances(instances, sort_by=None):
+    """Sort instances locally by `name` or `created` (ascending).
+
+    `sort_by` empty → the API order is preserved (a copy is returned, so the
+    caller's list is never mutated). `name` compares case-insensitively with an
+    id fallback; `created` compares parsed timestamps oldest-first with a text
+    fallback for unparseable values. Records missing the sort key are always
+    last, and `sorted()` keeps ties in their original relative order.
+    """
+    key = resolve_sort_by(sort_by)
+    if key is None:
+        return list(instances)
+    valid, invalid = [], []
+    for instance in instances:
+        usable, _value = _sort_value(instance, key)
+        (valid if usable else invalid).append(instance)
+    valid.sort(key=lambda item: _sort_value(item, key)[1])
+    return valid + invalid
 
 
 def list_instances_via_sdk(region, name=None,
@@ -618,6 +746,10 @@ def main(argv=None):
     parser.add_argument("--status",
                         help="按实例状态过滤（ACTIVE/FAILED/BUILDING 等；"
                              "RDS ListInstances API 无此参数，全量取回后本地过滤）")
+    parser.add_argument("--sort-by", dest="sort_by", default=None,
+                        help="排序字段：name（按实例名，大小写不敏感）或 "
+                             "created（按创建时间，旧→新）；排序在拉取列表后于本地"
+                             "执行，缺省保持 API 原序")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
                         dest="page_size", help="分页大小（默认 %d）" % DEFAULT_PAGE_SIZE)
     parser.add_argument("--operation", default=ALLOWED_OPERATION,
@@ -631,6 +763,9 @@ def main(argv=None):
         raw_argv = argv if argv is not None else sys.argv[1:]
         guard_write_intent(scrub_read_only_values(raw_argv))
         guard_operation(args.operation)
+        # Validate --sort-by before any API call so an unknown value fails fast
+        # and never writes a file.
+        sort_by = resolve_sort_by(args.sort_by)
         instances = list_instances(
             args.region,
             status=args.status,
@@ -638,8 +773,8 @@ def main(argv=None):
             limit=args.page_size,
             project_id=args.project_id,
         )
+        instances = sort_instances(instances, sort_by)
         output_path = args.output or os.path.join(os.getcwd(), DEFAULT_OUTPUT)
-        import datetime
         generated_at = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
         content = render_markdown(instances, args.region, generated_at)
@@ -659,6 +794,8 @@ def main(argv=None):
             filters.append("status=%s" % args.status)
         if args.name:
             filters.append("name=%s" % args.name)
+        if sort_by:
+            filters.append("sort-by=%s" % sort_by)
         suffix = "过滤条件: %s" % ", ".join(filters) if filters else "无过滤条件"
         print("已生成 Markdown 文件：%s（Region %s 无 RDS 实例，%s；"
               "已输出表头与空表提示）。"

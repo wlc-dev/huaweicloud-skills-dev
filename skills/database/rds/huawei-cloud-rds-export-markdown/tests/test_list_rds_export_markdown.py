@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ from list_rds_export_markdown import (  # noqa: E402
     ConfigError,
     GuardError,
     RdsListError,
+    SortError,
     build_command,
     classify_hcloud_failure,
     extract_instances,
@@ -27,8 +29,11 @@ from list_rds_export_markdown import (  # noqa: E402
     list_instances_via_sdk,
     main,
     normalize_instance,
+    parse_created,
     render_markdown,
+    resolve_sort_by,
     scrub_read_only_values,
+    sort_instances,
     write_markdown,
 )
 
@@ -118,6 +123,25 @@ class TestWriteIntentGuard(unittest.TestCase):
     def test_scrub_keeps_flag_itself_and_operation(self):
         argv = ["--operation", "DeleteInstance"]
         self.assertIn("DeleteInstance", scrub_read_only_values(argv))
+
+    def test_scrub_drops_sort_by_value(self):
+        # Regression: "created" contains the mutating keyword "create".
+        argv = ["--sort-by", "created", "--region", "cn-north-4"]
+        scrubbed = scrub_read_only_values(argv)
+        self.assertNotIn("created", scrubbed)
+        self.assertFalse(guard_write_intent(scrubbed))
+
+    def test_scrub_drops_inline_read_only_values(self):
+        for argv, leaked in ((["--sort-by=created"], "created"),
+                             (["--sort-by=name"], "name"),
+                             (["--output=/tmp/update-report.md"], "update-report")):
+            scrubbed = scrub_read_only_values(argv)
+            self.assertNotIn(leaked, scrubbed)
+            self.assertFalse(guard_write_intent(scrubbed))
+
+    def test_inline_mutating_operation_still_blocked(self):
+        with self.assertRaises(GuardError):
+            guard_write_intent(scrub_read_only_values(["--operation=DeleteInstance"]))
 
 
 class TestBuildCommand(unittest.TestCase):
@@ -513,6 +537,128 @@ class TestWriteMarkdown(unittest.TestCase):
             write_markdown("content", "\0bad\0path.md")
 
 
+class TestSortInstances(unittest.TestCase):
+    """Local ordering for --sort-by (the RDS ListInstances API has no ordering
+    parameter, so sorting is applied client-side after the full list is fetched)."""
+
+    def test_no_sort_by_preserves_api_order_and_copies(self):
+        source = [INSTANCE_2, INSTANCE_1]
+        result = sort_instances(source)
+        self.assertEqual(result, [INSTANCE_2, INSTANCE_1])
+        self.assertIsNot(result, source)
+        self.assertEqual(source, [INSTANCE_2, INSTANCE_1])
+
+    def test_empty_sort_by_is_a_no_op(self):
+        self.assertEqual(sort_instances([INSTANCE_1, INSTANCE_2], ""),
+                         [INSTANCE_1, INSTANCE_2])
+
+    def test_sort_by_name_case_insensitive_ascending(self):
+        items = [{"name": "zeta"}, {"name": "Alpha"}, {"name": "beta"}]
+        self.assertEqual([i["name"] for i in sort_instances(items, "name")],
+                         ["Alpha", "beta", "zeta"])
+
+    def test_sort_by_value_is_case_insensitive(self):
+        items = [{"name": "b"}, {"name": "a"}]
+        self.assertEqual([i["name"] for i in sort_instances(items, "NAME")], ["a", "b"])
+
+    def test_sort_by_name_falls_back_to_id(self):
+        items = [{"name": "rds-demo-01", "id": "rds-2"}, {"id": "rds-1"}]
+        self.assertEqual([i["id"] for i in sort_instances(items, "name")],
+                         ["rds-1", "rds-2"])
+
+    def test_sort_by_name_missing_key_last(self):
+        items = [{"status": "ACTIVE"}, {"name": "b"}, {"name": "a"}]
+        result = sort_instances(items, "name")
+        self.assertEqual([i.get("name") for i in result], ["a", "b", None])
+
+    def test_sort_by_created_mixed_formats_ascending(self):
+        # ISO8601 with Z, space-separated naive, and +0800 offsets must all be
+        # comparable (naive values are treated as UTC instead of raising
+        # TypeError on aware/naive comparison).
+        items = [
+            {"name": "newest", "created": "2026-03-01T10:00:00Z"},
+            {"name": "oldest", "created": "2025-12-31 23:59:59"},
+            {"name": "middle", "created": "2026-01-02T03:04:05+0800"},
+        ]
+        self.assertEqual([i["name"] for i in sort_instances(items, "created")],
+                         ["oldest", "middle", "newest"])
+
+    def test_sort_by_created_unparseable_falls_back_to_text(self):
+        items = [
+            {"name": "bad-b", "created": "zzz"},
+            {"name": "bad-a", "created": "aaa"},
+            {"name": "good", "created": "2026-01-01T00:00:00Z"},
+        ]
+        self.assertEqual([i["name"] for i in sort_instances(items, "created")],
+                         ["good", "bad-a", "bad-b"])
+
+    def test_sort_by_created_missing_key_last(self):
+        items = [
+            {"name": "none"},
+            {"name": "later", "created": "2026-02-01T00:00:00Z"},
+            {"name": "earlier", "created": "2026-01-01T00:00:00Z"},
+        ]
+        self.assertEqual([i["name"] for i in sort_instances(items, "created")],
+                         ["earlier", "later", "none"])
+
+    def test_sort_is_stable_for_equal_keys(self):
+        items = [
+            {"name": "same", "id": "rds-3", "created": "2026-01-01T00:00:00Z"},
+            {"name": "Same", "id": "rds-1", "created": "2026-01-01T00:00:00Z"},
+            {"name": "alpha", "id": "rds-2", "created": "2025-01-01T00:00:00Z"},
+        ]
+        self.assertEqual([i["id"] for i in sort_instances(items, "name")],
+                         ["rds-2", "rds-3", "rds-1"])
+        self.assertEqual([i["id"] for i in sort_instances(items, "created")],
+                         ["rds-2", "rds-3", "rds-1"])
+
+    def test_sort_does_not_mutate_input(self):
+        source = [INSTANCE_2, INSTANCE_1]
+        sort_instances(source, "name")
+        self.assertEqual(source, [INSTANCE_2, INSTANCE_1])
+
+    def test_empty_list_stays_empty(self):
+        self.assertEqual(sort_instances([], "name"), [])
+        self.assertEqual(sort_instances([], "created"), [])
+
+    def test_invalid_sort_by_raises_sort_error(self):
+        with self.assertRaises(SortError) as ctx:
+            sort_instances([INSTANCE_1], "status")
+        self.assertIn("--sort-by 仅支持 name 或 created", str(ctx.exception))
+        self.assertIn("status", str(ctx.exception))
+
+    def test_resolve_sort_by(self):
+        self.assertIsNone(resolve_sort_by(None))
+        self.assertIsNone(resolve_sort_by("   "))
+        self.assertEqual(resolve_sort_by(" NAME "), "name")
+        self.assertEqual(resolve_sort_by("created"), "created")
+        with self.assertRaises(SortError):
+            resolve_sort_by("create")
+
+    def test_parse_created_accepts_common_formats(self):
+        utc = datetime.timezone.utc
+        expected = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=utc)
+        for value in ("2026-01-02T03:04:05Z", "2026-01-02 03:04:05",
+                      "2026-01-02T03:04:05+00:00", "2026-01-02T03:04:05+0000"):
+            self.assertEqual(parse_created(value), expected, value)
+        self.assertEqual(parse_created("2026-01-02T11:04:05+0800"), expected)
+        self.assertIsNone(parse_created("not-a-date"))
+        self.assertIsNone(parse_created(""))
+
+
+def data_row_names(content):
+    """First-column values of the Markdown data rows (in file order)."""
+    names = []
+    for line in content.splitlines():
+        if not line.startswith("| "):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells[0] in ("实例名称", "---"):
+            continue
+        names.append(cells[0])
+    return names
+
+
 class TestMain(unittest.TestCase):
     def _run(self, argv, results, cwd=None):
         fake = FakeRunner(results)
@@ -644,10 +790,79 @@ class TestMain(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(os.path.isfile(path))
 
+    def test_sort_by_name_orders_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sorted-name.md")
+            payload = {"instances": [
+                {"name": "rds-zulu", "id": "rds-9", "created": "2026-01-01T00:00:00Z"},
+                {"name": "rds-alpha", "id": "rds-1", "created": "2026-02-01T00:00:00Z"},
+                {"name": "rds-Mike", "id": "rds-5", "created": "2026-03-01T00:00:00Z"},
+            ], "total_count": 3}
+            rc, out, err = self._run(
+                ["--region", "cn-north-4", "--sort-by", "name", "--output", path],
+                [(json.dumps(payload), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(data_row_names(handle.read()),
+                                 ["rds-alpha", "rds-Mike", "rds-zulu"])
+
+    def test_sort_by_created_orders_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sorted-created.md")
+            payload = {"instances": [
+                {"name": "rds-new", "id": "rds-3", "created": "2026-05-01T00:00:00Z"},
+                {"name": "rds-old", "id": "rds-1", "created": "2025-01-01 08:00:00"},
+                {"name": "rds-mid", "id": "rds-2", "created": "2026-01-01T00:00:00+0800"},
+            ], "total_count": 3}
+            rc, out, err = self._run(
+                ["--region", "cn-north-4", "--sort-by", "created", "--output", path],
+                [(json.dumps(payload), "", 0)])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(data_row_names(handle.read()),
+                                 ["rds-old", "rds-mid", "rds-new"])
+
+    def test_sort_by_created_passes_write_intent_guard(self):
+        # "created" must not be mistaken for the mutating keyword "create".
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "guarded.md")
+            rc, out, err = self._run(
+                ["--sort-by", "created", "--output", path],
+                [(json.dumps({"instances": [INSTANCE_1], "total_count": 1}), "", 0)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err, "")
+            self.assertTrue(os.path.isfile(path))
+
+    def test_no_sort_by_keeps_api_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "unordered.md")
+            payload = {"instances": [
+                {"name": "rds-demo-02", "id": "rds-2"},
+                {"name": "rds-demo-01", "id": "rds-1"},
+            ], "total_count": 2}
+            rc, out, err = self._run(["--output", path],
+                                     [(json.dumps(payload), "", 0)])
+            self.assertEqual(rc, 0)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(data_row_names(handle.read()),
+                                 ["rds-demo-02", "rds-demo-01"])
+
+    def test_invalid_sort_by_exits_1_without_query_or_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad-sort.md")
+            # FakeRunner([]) asserts no hcloud call is ever made.
+            rc, out, err = self._run(
+                ["--sort-by", "status", "--output", path], [])
+            self.assertEqual(rc, 1)
+            self.assertIn("--sort-by 仅支持 name 或 created", err)
+            self.assertIn("status", err)
+            self.assertFalse(os.path.exists(path))
+
 
 class TestErrorHierarchy(unittest.TestCase):
     def test_subclasses(self):
-        for exc in (GuardError, ConfigError, AuthError, ApiError):
+        for exc in (GuardError, ConfigError, AuthError, ApiError, SortError):
             self.assertTrue(issubclass(exc, RdsListError))
 
 

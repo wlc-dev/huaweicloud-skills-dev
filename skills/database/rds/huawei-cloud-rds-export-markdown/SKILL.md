@@ -16,6 +16,11 @@ description: |
      KooCLI global `--cli-project-id`. Optional `--name` server-side filter and
      `--status` client-side filter (the real ListInstances API has no status
      parameter, so the full list is fetched first and filtered locally).
+     Optional `--sort-by name|created` orders the exported rows locally, after the
+     filters: `name` compares instance names case-insensitively (id fallback),
+     `created` compares creation timestamps oldest-first. The API has no ordering
+     parameter, so sorting is always client-side; omitting `--sort-by` keeps the
+     API order and the previous output unchanged.
   4. Explicit error classification: empty instance list (still writes the file),
      missing AK/SK credentials (「缺少 AK/SK 凭证」), 403 / insufficient IAM
      permission (「无权限访问 RDS，请检查 IAM 权限」), hcloud not installed (falls
@@ -29,8 +34,8 @@ description: |
      Markdown", "RDS list markdown", "RDS inventory markdown", "华为云RDS导出
      markdown", "export RDS instances to markdown".
   7. Offline unit tests (mocked hcloud subprocess) cover the guard, paging,
-     filters, Markdown rendering, atomic file writing, error classification, SDK
-     fallback and all output modes.
+     filters, local sorting (`--sort-by name` / `created`), Markdown rendering,
+     atomic file writing, error classification, SDK fallback and all output modes.
 tags: [huawei-cloud, rds, database, readonly, markdown]
 ---
 
@@ -67,6 +72,14 @@ Key properties:
   hcloud binary is absent, the script falls back to the official
   `huaweicloudsdkrds` v3 SDK (`list_instances`). Credentials are always read by
   the CLI profile / SDK environment — never handled by the script.
+- **Local sorting** — `--sort-by name|created` orders the rows in memory after
+  the full (paged) list has been fetched; the ListInstances API has no ordering
+  parameter. `name` compares case-insensitively with an id fallback, `created`
+  compares parsed timestamps oldest-first (ISO-8601, `Z`/`+0800` offsets and
+  space-separated values all accepted). Records whose sort key is missing are
+  always placed last, unparseable timestamps fall back to text comparison, and
+  the stable sort keeps ties in their original order. Omit `--sort-by` to keep
+  the API order unchanged.
 - **Empty result is not an error** — an empty instance list (or a filter that
   matches nothing) still produces a valid `.md` file with the table header and
   an explicit "no instances" note, and exits `0`.
@@ -137,7 +150,8 @@ instance list must be saved as a distributable / archivable Markdown document.
    region-scoped. Optionally pass `--project_id`.
 3. **Confirm KooCLI readiness** (optional, read-only) — the credential check in
    Core Commands.
-4. **Run the export script** with the desired output path and optional filters.
+4. **Run the export script** with the desired output path, optional filters and
+   an optional `--sort-by` ordering.
 5. **Read the result** — the printed path is the generated Markdown report; open
    that file to see the instance-name table.
 6. **Handle the empty / error cases** per the Error Handling table below (an
@@ -159,6 +173,18 @@ python3 scripts/list_rds_export_markdown.py --region cn-north-4 \
 # Name filter (server-side) and status filter (applied client-side)
 python3 scripts/list_rds_export_markdown.py --name rds-demo --status ACTIVE \
   --output /tmp/rds_active.md
+
+# Sort by instance name (case-insensitive, id fallback) — applied client-side
+python3 scripts/list_rds_export_markdown.py --region cn-north-4 \
+  --sort-by name --output /tmp/rds_sorted_by_name.md
+
+# Sort by creation time, oldest first (client-side; missing/unparseable last)
+python3 scripts/list_rds_export_markdown.py --region cn-north-4 \
+  --sort-by created --output /tmp/rds_sorted_by_created.md
+
+# Filter first, then sort (status filtering runs before the ordering)
+python3 scripts/list_rds_export_markdown.py --status ACTIVE --sort-by name \
+  --output /tmp/rds_active_sorted.md
 
 # Project-scoped (mapped to the KooCLI global --cli-project-id)
 python3 scripts/list_rds_export_markdown.py --project_id <project_id> \
@@ -184,6 +210,7 @@ skill-quality-cli run --skill-name huawei-cloud-rds-export-markdown -- hcloud RD
 | `--output` / `-o` | No | Markdown output file path (default current dir `rds_instances.md`) | `/tmp/rds.md` |
 | `--name` | No | Filter by instance name (server-side ListInstances parameter) | `rds-demo` |
 | `--status` | No | Filter by instance state — **applied client-side** (RDS ListInstances has no status API parameter; the full list is fetched, then filtered locally, case-insensitive) | `ACTIVE`, `FAILED`, `BUILDING` |
+| `--sort-by` | No | Order the rows — **applied client-side** after the filters (the API has no ordering parameter): `name` = instance name ascending, case-insensitive, `id` fallback; `created` = creation time ascending (oldest first), missing/unparseable values last. Omitted → API order preserved | `name`, `created` |
 | `--page-size` | No | Page size for ListInstances (default 100) | `100` |
 | `--operation` | No | hcloud RDS operation name; only `ListInstances` is allowed | `ListInstances` |
 | `--stdout` | No | Also print the rendered Markdown to stdout (the file is still written) | `--stdout` |
@@ -216,8 +243,11 @@ An empty instance list produces the header + separator followed by a note line
   `stop`, `start`, `shutdown`, `restore`, `destroy`, and RDS operation names such
   as `CreateInstance`, `DeleteInstance`, `ResizeFlavor`).
 - Values of read-only flags (the local `--output` path, `--region`,
-  `--project_id`, `--name`, `--status`, ...) are excluded from the scan so a
-  file path or filter value is never mistaken for an RDS operation.
+  `--project_id`, `--name`, `--status`, `--sort-by`, ...) are excluded from the
+  scan so a file path, a filter value or a sort option is never mistaken for an
+  RDS operation. `--sort-by` is in that whitelist on purpose: its value
+  `created` contains the mutating keyword `create`, and both `--sort-by created`
+  and `--sort-by=created` must pass the guard.
 - Any hit raises `GuardError`, prints `[错误] 检测到写操作意图 ... 已被守卫拦截`,
   and exits with code 1 **before** a single hcloud command is executed. No write
   operation can be constructed by `build_command()`; there is no code path that
@@ -240,7 +270,8 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
   `--name=rds-01`, `--datastore_type=MySQL`, `--id=rds-01`. There is **no
   `--status` parameter** on the real RDS ListInstances API (verified via
   `hcloud RDS ListInstances --help`); status filtering is done client-side by
-  the script.
+  the script. There is likewise **no ordering parameter** — `--sort-by` is a
+  script-side option only and is never sent to hcloud / the SDK.
 - **REST path (official SDK `_http_info`)** —
   `GET /v3/{project_id}/instances` (`huaweicloudsdkrds` v3
   `_list_instances_http_info`); project_id is resolved by KooCLI / the SDK from
@@ -264,6 +295,7 @@ production):
 | hcloud not installed | Falls back to the SDK; if the SDK is unavailable too, exit 1 with a clear hint |
 | Bad `--output` path (permission / bad directory) | Exit 1, `Markdown 文件写出失败` hint; no partial file left |
 | KooCLI usage error (`[USE_ERROR] ...`, even with exit code 0) | Exit 1, explicit `hcloud 参数错误` hint pointing to `hcloud RDS ListInstances --help` |
+| Unknown `--sort-by` value | Exit 1, `--sort-by 仅支持 name 或 created（收到: xxx）`; fails before any API call, no file written |
 | Network / API failure | Exit 1 with the hcloud stderr excerpt |
 | Write intent detected | Exit 1, `GuardError` message, no command executed, no file written |
 
@@ -282,6 +314,9 @@ error.
 | `--output` points to a non-existing directory | Directory is created automatically |
 | `--output` path contains a guard keyword (e.g. `downloads/update-*.md`) | Path value is excluded from the guard (local path ≠ RDS operation) |
 | `--status BUILDING` | Legitimate read filter — the status value is not sent to the server |
+| `--sort-by` omitted | Original API order preserved (no reordering, output unchanged) |
+| `--sort-by name` with duplicate / mixed-case names | Case-insensitive compare, stable sort keeps ties in the original relative order; records without `name` fall back to `id` |
+| `--sort-by created` with missing / unparseable timestamp | Parse failure falls back to text comparison; a missing `created` is always placed last instead of aborting the export |
 | hcloud absent, SDK installed | Transparent fallback to `huaweicloudsdkrds` list_instances, same Markdown output |
 | User asks to create/delete/restart | Out of scope — blocked by the write-intent guard |
 
@@ -295,14 +330,19 @@ python3 -m unittest discover -s tests -v
 ```
 
 Coverage: write-intent guard (read passes / create / delete / mutating verbs /
-normalized separators / operation whitelist / read-only value scrubbing), command
-construction (`--cli-region` / limit / offset / name / `--cli-project-id`, no
-write flags / no status), JSON extraction and instance extraction, failure
+normalized separators / operation whitelist / read-only value scrubbing including
+`--sort-by created` and `--flag=value` forms), command construction
+(`--cli-region` / limit / offset / name / `--cli-project-id`, no write flags / no
+status / no ordering), JSON extraction and instance extraction, failure
 classification (missing AK/SK, 403, generic, `[USE_ERROR]` with rc=0), offset
-paging (total / full page / empty), client-side status filtering, SDK fallback
-(env credentials / missing credentials / unavailable), normalization, Markdown
-rendering (title / header / rows / empty-result note / pipe & newline escaping),
-atomic file writing (missing dirs / bad path), and all `main()` output modes.
+paging (total / full page / empty), client-side status filtering, local sorting
+(`--sort-by name` case-insensitive + id fallback + missing last, `--sort-by
+created` mixed timestamp formats + text fallback + missing last + stable ties,
+no-argument order preservation, unknown value), SDK fallback (env credentials /
+missing credentials / unavailable), normalization, Markdown rendering (title /
+header / rows / empty-result note / pipe & newline escaping), atomic file writing
+(missing dirs / bad path), and all `main()` output modes (including the sorted
+row order and the fail-fast exit 1 for an unknown `--sort-by`).
 
 ## Reference Documents
 
