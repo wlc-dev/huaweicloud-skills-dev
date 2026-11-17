@@ -6,12 +6,13 @@ Primary execution path is KooCLI; when hcloud is not installed, the script falls
 back to the official `huaweicloudsdkdcs` v2 SDK (`DcsClient.list_instances`).
 Reads nothing but the active credential profile / environment. Supports four
 output modes (--names-only / table / --json / Markdown table), --name /
---instance-id / --ip / --status / --tags filtering and automatic --limit /
---offset paging (the real ListInstances API parameters, verified against
-`hcloud DCS ListInstances --help` and the huaweicloudsdkdcs v2
-ListInstancesRequest model), plus a strict write-intent guard: any argument
-that looks like a mutating DCS operation is rejected before a single command
-is executed.
+--instance-id / --ip / --status / --tags filtering, optional --sort-by
+name|created ordering (client-side, case-insensitive name / ascending
+created_at, stable) and automatic --limit / --offset paging (the real
+ListInstances API parameters, verified against `hcloud DCS ListInstances
+--help` and the huaweicloudsdkdcs v2 ListInstancesRequest model), plus a
+strict write-intent guard: any argument that looks like a mutating DCS
+operation is rejected before a single command is executed.
 
 Markdown mode (--md / --format md) prints a GitHub-flavored table whose ten
 columns match huawei-cloud-dcs-export-markdown verbatim (名称/ID/引擎/版本/
@@ -25,6 +26,7 @@ Usage:
                                  [--format names|table|json|md] [--md-output <path>]
                                  [--name cache] [--instance-id <id>] [--ip <ip>]
                                  [--status RUNNING] [--tags env=prod]
+                                 [--sort-by name|created]
                                  [--page-size 100] [--operation ListInstances]
 
 Environment overrides (mostly for tests):
@@ -56,6 +58,11 @@ MODE_JSON = "json"
 MODE_MD = "md"
 MODE_CHOICES = (MODE_NAMES, MODE_TABLE, MODE_JSON, MODE_MD)
 DEFAULT_MODE = MODE_NAMES
+
+# Client-side ordering (--sort-by). Both orders are ascending and stable.
+SORT_NAME = "name"
+SORT_CREATED = "created"
+SORT_CHOICES = (SORT_NAME, SORT_CREATED)
 
 # Markdown table contract — kept byte-identical to
 # huawei-cloud-dcs-export-markdown/scripts/export_markdown.py::MD_HEADERS so
@@ -613,6 +620,37 @@ def _field(instance, *names, default="-"):
     return default
 
 
+def _sort_name_key(instance):
+    """Case-insensitive instance-name key, falling back to the instance id."""
+    name = _field(instance, "name", "instance_name", default=None)
+    if name is None:
+        name = _field(instance, "instance_id", "id", default="")
+    return str(name).strip().lower()
+
+
+def _sort_created_key(instance):
+    """Ascending created_at key (ISO8601 sorts lexicographically); missing last."""
+    created = _field(instance, "created_at", default=None)
+    if created is None:
+        return (1, "")
+    return (0, str(created))
+
+
+def sort_instances(instances, sort_by):
+    """Return a stably ordered copy of ``instances`` (ascending).
+
+    ``name`` sorts case-insensitively by instance name (missing name falls
+    back to the instance id); ``created`` sorts by the ISO8601 ``created_at``
+    string, with instances missing that field pushed to the end. Ties keep
+    their original (paged) order because ``sorted`` is stable.
+    """
+    if not sort_by:
+        return list(instances)
+    if sort_by == SORT_NAME:
+        return sorted(instances, key=_sort_name_key)
+    return sorted(instances, key=_sort_created_key)
+
+
 def instance_names(instances):
     names = []
     for instance in instances:
@@ -774,10 +812,14 @@ def _empty_hint(region, args):
 # The local Markdown output path is not a DCS operation — it is stripped from
 # the write-intent scan so a path such as ``.../dcs-backup.md`` never trips it.
 _MD_OUTPUT_FLAGS = ("--md-output", "--md_output")
+# --sort-by values are ordering choices, not DCS operations. The value
+# ``created`` contains the substring ``create``, so the value must be skipped
+# (the argument itself is still validated against SORT_CHOICES in main()).
+_SORT_BY_FLAGS = ("--sort-by", "--sort_by")
 
 
 def guard_argv(argv):
-    """Scan user argv for write intent, ignoring the local --md-output value."""
+    """Scan user argv for write intent, ignoring --md-output/--sort-by values."""
     tokens = []
     skip_next = False
     for token in argv:
@@ -785,10 +827,11 @@ def guard_argv(argv):
             skip_next = False
             continue
         name = str(token)
-        if name in _MD_OUTPUT_FLAGS:
+        if name in _MD_OUTPUT_FLAGS or name in _SORT_BY_FLAGS:
             skip_next = True
             continue
-        if name.startswith("--md-output=") or name.startswith("--md_output="):
+        if (name.startswith("--md-output=") or name.startswith("--md_output=")
+                or name.startswith("--sort-by=") or name.startswith("--sort_by=")):
             continue
         tokens.append(name)
     return guard_write_intent(" ".join(tokens))
@@ -826,6 +869,9 @@ def main(argv=None):
                         help="按实例状态过滤（服务端查询参数，如 RUNNING/ERROR）")
     parser.add_argument("--tags",
                         help="按标签过滤（服务端查询参数，格式 key1=value1,key2=value2）")
+    parser.add_argument("--sort-by", dest="sort_by", default=None,
+                        help="按 name（实例名，大小写不敏感升序）或 created"
+                             "（创建时间升序）排序；不传保持接口返回顺序")
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE,
                         dest="page_size",
                         help="分页大小（默认 %d，范围 1~1000，自动翻页取全量）" % DEFAULT_PAGE_SIZE)
@@ -846,6 +892,10 @@ def main(argv=None):
         if args.page_size is not None:
             if args.page_size < 1 or args.page_size > 1000:
                 raise ApiError("--page-size 超出范围（1~1000）：%d" % args.page_size)
+        if args.sort_by is not None and args.sort_by not in SORT_CHOICES:
+            raise ApiError(
+                "--sort-by 取值非法：%r。仅支持 %s（按实例名升序）或 %s"
+                "（按创建时间升序）。" % (args.sort_by, SORT_NAME, SORT_CREATED))
         mode = resolve_mode(args.fmt, as_json=args.as_json,
                             as_table=args.as_table, names_only=args.names_only,
                             as_md=args.as_md)
@@ -877,6 +927,10 @@ def main(argv=None):
             ]
         else:
             instances = []
+
+    # --sort-by: order the full paged + filtered result before every output
+    # branch (including the early --json return), so names/table/md/json agree.
+    instances = sort_instances(instances, args.sort_by)
 
     if mode == MODE_JSON:
         print(json.dumps(instances, ensure_ascii=False, indent=2))

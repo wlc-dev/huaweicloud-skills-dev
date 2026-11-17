@@ -39,6 +39,7 @@ from list_dcs import (  # noqa: E402
     render_markdown,
     render_table,
     resolve_mode,
+    sort_instances,
     write_markdown_file,
 )
 
@@ -578,6 +579,61 @@ class TestNormalizeAndRender(unittest.TestCase):
         self.assertEqual(instance_names([{"instance_id": "id-9"}]), ["id-9"])
 
 
+class TestSortInstances(unittest.TestCase):
+    """Client-side --sort-by ordering (ascending, stable)."""
+
+    def test_sort_by_name_case_insensitive(self):
+        instances = [
+            {"name": "beta", "instance_id": "id-2"},
+            {"name": "Alpha", "instance_id": "id-1"},
+            {"name": "cache", "instance_id": "id-3"},
+        ]
+        ordered = sort_instances(instances, "name")
+        self.assertEqual([i["name"] for i in ordered], ["Alpha", "beta", "cache"])
+
+    def test_sort_by_name_falls_back_to_instance_id(self):
+        instances = [
+            {"instance_id": "id-z"},
+            {"name": "alpha", "instance_id": "id-a"},
+            {"name": "", "instance_id": "id-b"},
+        ]
+        ordered = sort_instances(instances, "name")
+        self.assertEqual([i["instance_id"] for i in ordered],
+                         ["id-a", "id-b", "id-z"])
+
+    def test_sort_by_name_is_stable_for_ties(self):
+        instances = [
+            {"name": "same", "instance_id": "first"},
+            {"name": "Same", "instance_id": "second"},
+        ]
+        ordered = sort_instances(instances, "name")
+        self.assertEqual([i["instance_id"] for i in ordered],
+                         ["first", "second"])
+
+    def test_sort_by_created_ascending_missing_last(self):
+        instances = [
+            {"name": "new", "created_at": "2026-03-01T00:00:00+08:00"},
+            {"name": "missing"},
+            {"name": "old", "created_at": "2026-01-01T00:00:00+08:00"},
+        ]
+        ordered = sort_instances(instances, "created")
+        self.assertEqual([i["name"] for i in ordered], ["old", "new", "missing"])
+
+    def test_sort_by_created_is_stable_for_ties(self):
+        instances = [
+            {"name": "first", "created_at": "2026-01-01T00:00:00+08:00"},
+            {"name": "second", "created_at": "2026-01-01T00:00:00+08:00"},
+        ]
+        ordered = sort_instances(instances, "created")
+        self.assertEqual([i["name"] for i in ordered], ["first", "second"])
+
+    def test_no_sort_preserves_api_order(self):
+        instances = [{"name": "b"}, {"name": "a"}]
+        ordered = sort_instances(instances, None)
+        self.assertEqual([i["name"] for i in ordered], ["b", "a"])
+        self.assertIsNot(ordered, instances)
+
+
 class TestMain(unittest.TestCase):
     def _run(self, argv, results):
         fake = FakeRunner(results)
@@ -680,6 +736,110 @@ class TestMain(unittest.TestCase):
         self.assertIn("cache-demo-01", out)
         self.assertNotIn("- cache-demo-02", out)
         self.assertFalse(any("--name=" in part for part in fake.calls[0]))
+
+    def test_sort_by_invalid_value_lists_choices(self):
+        # ``created`` must never reach the write-intent guard as ``create``;
+        # an unknown value is still rejected with the allowed choices.
+        rc, out, err = self._run(["--sort-by", "create"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("name", err)
+        self.assertIn("created", err)
+        self.assertNotIn("写操作意图", err)
+
+    def test_sort_by_unknown_value_rejected(self):
+        rc, out, err = self._run(["--sort-by", "size"], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("--sort-by", err)
+        self.assertIn("name", err)
+        self.assertIn("created", err)
+
+    def test_sort_by_name_orders_names_output(self):
+        rc, out, err = self._run(
+            ["--sort-by", "name", "--names-only"],
+            [(json.dumps({"instances": [
+                {"name": "zeta", "instance_id": "id-z"},
+                {"name": "Alpha", "instance_id": "id-a"},
+                {"name": "beta", "instance_id": "id-b"},
+            ], "instance_num": 3}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertLess(out.index("- Alpha"), out.index("- beta"))
+        self.assertLess(out.index("- beta"), out.index("- zeta"))
+
+    def test_sort_by_created_orders_json_output(self):
+        rc, out, err = self._run(
+            ["--json", "--sort-by", "created"],
+            [(json.dumps({"instances": [
+                {"name": "new", "created_at": "2026-03-01T00:00:00+08:00"},
+                {"name": "missing"},
+                {"name": "old", "created_at": "2026-01-01T00:00:00+08:00"},
+            ], "instance_num": 3}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual([i["name"] for i in json.loads(out)],
+                         ["old", "new", "missing"])
+
+    def test_sort_by_created_orders_table_and_md_output(self):
+        payload = json.dumps({"instances": [
+            {"name": "new", "instance_id": "id-n",
+             "created_at": "2026-03-01T00:00:00+08:00"},
+            {"name": "old", "instance_id": "id-o",
+             "created_at": "2026-01-01T00:00:00+08:00"},
+        ], "instance_num": 2})
+        for argv in (["--table", "--sort-by", "created"],
+                     ["--md", "--sort-by", "created"],
+                     ["--format", "md", "--sort-by", "created"]):
+            rc, out, err = self._run(argv, [(payload, "", 0)])
+            self.assertEqual(rc, 0, err)
+            self.assertLess(out.index("id-o"), out.index("id-n"))
+
+    def test_sort_by_name_still_applies_after_name_equal_filter(self):
+        rc, out, err = self._run(
+            ["--names-only", "--name-equal", "--name", "cAcHe-A",
+             "--sort-by", "name"],
+            [(json.dumps({"instances": [
+                {"name": "cache-b"},
+                {"name": "Cache-A"},
+                {"name": "cache-a"},
+                {"name": "other"},
+            ], "instance_num": 4}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertLess(out.index("- Cache-A"), out.index("- cache-a"))
+        self.assertNotIn("- cache-b", out)
+        self.assertNotIn("- other", out)
+
+    def test_sort_by_created_stays_ordered_across_pages(self):
+        page1 = json.dumps({"instances": [
+            {"name": "p1-new", "created_at": "2026-04-01T00:00:00+08:00"},
+            {"name": "p1-old", "created_at": "2026-02-01T00:00:00+08:00"},
+        ], "instance_num": 4})
+        page2 = json.dumps({"instances": [
+            {"name": "p2-new", "created_at": "2026-05-01T00:00:00+08:00"},
+            {"name": "p2-old", "created_at": "2026-01-01T00:00:00+08:00"},
+        ], "instance_num": 4})
+        rc, out, err = self._run(
+            ["--json", "--sort-by", "created", "--page-size", "2"],
+            [(page1, "", 0), (page2, "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual([i["name"] for i in json.loads(out)],
+                         ["p2-old", "p1-old", "p1-new", "p2-new"])
+
+    def test_sort_by_absent_keeps_api_order(self):
+        rc, out, err = self._run(
+            ["--json"],
+            [(json.dumps({"instances": [
+                {"name": "zeta"}, {"name": "alpha"},
+            ], "instance_num": 2}), "", 0)])
+        self.assertEqual(rc, 0)
+        self.assertEqual([i["name"] for i in json.loads(out)],
+                         ["zeta", "alpha"])
+
+    def test_guard_argv_strips_sort_by_value(self):
+        # ``created`` contains ``create``; the value must be exempted while
+        # every other argument is still scanned.
+        self.assertFalse(guard_argv(["--sort-by", "created"]))
+        self.assertFalse(guard_argv(["--sort-by=created"]))
+        self.assertFalse(guard_argv(["--sort_by", "name"]))
+        with self.assertRaises(GuardError):
+            guard_argv(["--sort-by", "created", "--name", "delete-me"])
 
     def test_page_size_out_of_range(self):
         rc, out, err = self._run(["--page-size", "0"], [])

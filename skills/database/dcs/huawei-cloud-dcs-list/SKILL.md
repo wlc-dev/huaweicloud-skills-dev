@@ -14,8 +14,10 @@ description: |
      换行转空格). --md-output <path> 可把该表格原子落盘（内容与 stdout 一致）.
   3. Supports --name (server-side fuzzy query, plus --name-equal exact match),
      --instance-id / --ip / --status / --tags filtering (all real server-side
-     ListInstances query parameters), region override, and automatic
-     limit/offset paging.
+     ListInstances query parameters), region override, optional --sort-by
+     name|created (client-side ascending order: case-insensitive instance name
+     or created_at, missing values last, stable), and automatic limit/offset
+     paging.
   4. Explicit error hints for empty instance lists (「当前区域无 DCS 实例」),
      403 / insufficient IAM permission (「无权限访问分布式缓存服务（DCS）」), missing
      or invalid AK/SK credentials, missing project_id on the SDK fallback, and
@@ -84,6 +86,13 @@ Key properties:
   (verified against `hcloud DCS ListInstances --help`); paging uses
   `--limit` (1~1000) + `--offset` and is fetched automatically until
   `instance_num` is reached.
+- **Optional client-side ordering** — `--sort-by name` orders the fully
+  paged (and locally filtered) result by instance name, case-insensitive
+  (missing name falls back to `instance_id`); `--sort-by created` orders by
+  `created_at` ascending (ISO8601, missing values last). Both are stable and
+  applied to every output mode (names / table / json / md); without
+  `--sort-by` the API order is kept unchanged. Ordering is client-side only —
+  it is never sent to the service.
 - **Offline-testable** — every code path (filters, paging, error
   classification, guard, SDK fallback) is covered by unit tests that mock
   the hcloud subprocess.
@@ -160,6 +169,11 @@ python3 scripts/list_dcs.py --ip 192.168.0.10
 python3 scripts/list_dcs.py --status RUNNING
 python3 scripts/list_dcs.py --tags env=prod
 
+# Optional client-side ordering (ascending, stable): instance name / created_at
+python3 scripts/list_dcs.py --sort-by name
+python3 scripts/list_dcs.py --sort-by created --format md
+python3 scripts/list_dcs.py --sort-by name --status RUNNING --json
+
 # Automatic paging; page size is tunable (1~1000, default 100)
 python3 scripts/list_dcs.py --page-size 500
 
@@ -192,6 +206,7 @@ hcloud DCS ListInstances --cli-region=cn-north-4 --name=cache-demo --status=RUNN
 | `--ip` | No | Filter by connection IP address — real server-side query parameter | `192.168.0.10` |
 | `--status` | No | Filter by instance state — real server-side query parameter (`RUNNING` / `ERROR` / ...) | `RUNNING` |
 | `--tags` | No | Filter by instance tags — real server-side query parameter (`key1=value1,key2=value2`) | `env=prod` |
+| `--sort-by` | No | Client-side ascending order for all output modes: `name` (case-insensitive instance name, missing name falls back to id) / `created` (ISO8601 `created_at`, missing last); stable, never sent to the service; omitted → API order | `name` |
 | `--page-size` | No | Page size for ListInstances (default 100, range 1–1000; pages are fetched automatically) | `500` |
 | `--project-id` | No | Project ID (needed by the SDK fallback path for `/v2/{project_id}/instances`) | `05f...` |
 | `--operation` | No | hcloud DCS operation name; only `ListInstances` is allowed | `ListInstances` |
@@ -258,6 +273,7 @@ hcloud <Service> <Operation> --cli-region=<region> [--key=value ...]
 | DCS API error body returned with exit code 0 (e.g. `DCS.4062` invalid parameter) | Exit 1, `DCS API 错误 <error_code>: <error_msg>` — never reported as unparseable output (a diagnostic table appended after the JSON is ignored) |
 | KooCLI usage error (`[USE_ERROR] ...`, even with exit code 0) | Exit 1, explicit `hcloud 参数错误` hint pointing to `hcloud DCS ListInstances --help` |
 | `--page-size` out of range (not 1~1000) | Exit 1, explicit range error before any call |
+| `--sort-by` value not `name` / `created` | Exit 1, explicit `--sort-by 取值非法` hint listing `name` / `created` (the value is exempt from the write-intent scan, so `created` is not mistaken for `create`) |
 | `--md-output` given outside md mode | Exit 1, explicit hint that `--md-output` requires `--md` / `--format md` |
 | `--md-output` write failure (permissions / disk) | Exit 1, `[错误] Markdown 文件写入失败…，未留下残缺文件`; no partial target file, temp file removed |
 | Write intent detected | Exit 1, `GuardError` message, no command executed |
@@ -271,6 +287,7 @@ Exit codes: `0` success / empty region; `1` config, auth, guard, or API error.
 | Non-`RUNNING` instances (ERROR / FROZEN / ...) | Reported with their state, not treated as failure |
 | `--name` | Forwarded as the real fuzzy server-side query parameter; `--name-equal` switches to exact local matching (case-insensitive) |
 | `--instance-id` / `--ip` / `--status` / `--tags` filters | Forwarded as real server-side query parameters (verified API params) |
+| `--sort-by` ordering | Applied client-side after full paging + `--name-equal` filtering and before every output branch, so names/table/json/md (including `--json`) share the same order; stable for equal keys; missing `name` falls back to id, missing `created_at` goes last |
 | Large instance count | Automatic `limit`/`offset` paging driven by `instance_num` (max 100 pages) |
 | Extra response fields | Table columns are built from the union of returned fields — new fields appear automatically |
 | Field missing on an instance | Rendered as `-` in the table (and in md mode) |
@@ -308,7 +325,9 @@ construction matches the real `ListInstancesRequest` signature), rendering
 (table with engine/capacity/status/ip/port/az fields / names / fallbacks),
 Markdown mode (fixed 10-column header + separator, column order, `-` for
 missing fields, pipe/newline escaping, `--md` vs `--format md` equivalence,
-filters/paging combination, empty list → no header and no file, atomic
+filters/paging combination, empty list → no header and no file, `--sort-by`
+name/created across all output modes + cross-page ordering + stable ties +
+missing-field placement + invalid value + guard exemption, atomic
 `--md-output` write + write-failure cleanup, `--md-output` rejected outside md
 mode, mode precedence), and all `main()` output modes including default names
 list, empty, filter, exact-name and error paths.
