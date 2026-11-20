@@ -997,10 +997,10 @@ def main(argv=None):
     parser.add_argument("--csv-bom", action="store_true", dest="csv_bom",
                         help="csv 模式可选：输出/落盘时带上 UTF-8 BOM（Excel 识别中文）")
     parser.add_argument("--name",
-                        help="按实例名称过滤（服务端查询参数，模糊匹配；"
-                             "name_equal 精确匹配开关由 --name-equal 提供）")
+                        help="按实例名称过滤（服务端模糊查询；精确匹配请配合 "
+                             "--name-equal，由客户端本地过滤）")
     parser.add_argument("--name-equal", action="store_true", dest="name_equal",
-                        help="按实例名称精确匹配（转发服务端 name_equal=true）")
+                        help="按实例名称精确匹配（客户端过滤、大小写不敏感；需配合 --name）")
     parser.add_argument("--instance-id", dest="instance_id",
                         help="按实例 ID 过滤（服务端查询参数）")
     parser.add_argument("--ip",
