@@ -192,6 +192,9 @@ PREFERRED_COLUMNS = [
     "sub_status",
 ]
 
+# ListInstances responses expose the list under one of these keys depending on
+# the KooCLI/SDK version; keep the order stable so the canonical `instances`
+# key wins when more than one is present.
 _INSTANCE_LIST_KEYS = ("instances", "instance_list", "instances_detail")
 
 _CREDENTIAL_MISSING_PATTERNS = (
